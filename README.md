@@ -1,6 +1,14 @@
 <div align="center">
   <h1>Neryba</h1>
   <p><em>Нериба — "not-a-fish"</em></p>
+
+<br>
+
+[![lichess-blitz](https://lichess-shield.vercel.app/api?username=neryba&format=blitz)](https://lichess.org/@/neryba/perf/blitz)
+[![lichess-rapid](https://lichess-shield.vercel.app/api?username=neryba&format=rapid)](https://lichess.org/@/neryba/perf/rapid)
+
+<br>
+
 </div>
 
 Neryba is an original chess engine written in Rust, grown exclusively
@@ -9,19 +17,31 @@ without a measured, committed-in-advance verdict behind it. Zero
 borrowed code, zero dependencies — the *not-a-clone* principle is baked
 into the name.
 
-Every feature you see here — NNUE evaluation (trained on the engine's
-own self-play data), the search stack, time management — earned its
-place through an SPRT gate or was honestly buried trying. The graveyard
-of killed ideas is as much a product as the engine itself.
+Every change is gated by a pre-registered SPRT; the experiment log —
+preregistrations, verdicts, the harness, training pipelines — lives in
+a private research repository and will be published in full. The
+`// probe NNNN` comments in the source are keys into that record; this
+repository is the engine as it plays. Preregistration commits are
+notarized against an off-machine mirror since July 9, 2026; records
+before that date rest on the author's word alone.
 
 ## Play it
 
 Neryba plays live on Lichess: **[BOT neryba](https://lichess.org/@/neryba)** —
 challenges welcome (blitz, 3+2 to 5+3).
 
-The Rust engine entered the bot pool at around the 2000 mark (July 2026);
-as of **July 9, 2026** its Lichess blitz rating is **2370** — every point
-of that climb is an SPRT-gated change, deployed one verdict at a time.
+Baseline at the time of this commit: **2377 Lichess blitz (July 9,
+2026)**. The live badges above track it from here. The pool rating is
+an invitation to play, not a measurement — it moves with provisional
+convergence, pool composition, and infrastructure noise.
+
+The measurement is this. The first SPRT-gated package (RFP + persistent
+search state + history aging) was claimed at +131 Elo by the internal
+self-play probes that gated it. An external gauntlet at 10+0.1 measured
++75 (probe 0065). The 43% shrinkage is documented rather than explained
+away — and it is not yet resolved whether it comes from the self-play
+pool, from the time control, or from the false-green rate implied by
+running SPRTs at α=0.05.
 
 ## Facts
 
