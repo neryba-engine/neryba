@@ -1,0 +1,5 @@
+target
+/neryba
+/neryba.exe
+src/nets/*.bin
+!src/nets/neryba1.bin

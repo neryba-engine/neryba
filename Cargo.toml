@@ -1,0 +1,16 @@
+[package]
+name = "neryba"
+version = "0.0.1"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+# Zero dependencies, zero borrowed code — the not-a-clone principle.
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Capacity A/B builds (default = production net, HIDDEN=128).
+# Mutually exclusive; enable exactly one, if any.
+[features]
+nnue_h512 = []
+nnue_h1024 = []
