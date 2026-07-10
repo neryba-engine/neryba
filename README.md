@@ -6,6 +6,7 @@
 
 [![lichess-blitz](https://lichess-shield.vercel.app/api?username=neryba&format=blitz)](https://lichess.org/@/neryba/perf/blitz)
 [![lichess-rapid](https://lichess-shield.vercel.app/api?username=neryba&format=rapid)](https://lichess.org/@/neryba/perf/rapid)
+[![lichess-bullet](https://lichess-shield.vercel.app/api?username=neryba&format=bullet)](https://lichess.org/@/neryba/perf/bullet)
 
 <br>
 
@@ -38,18 +39,23 @@ convergence, pool composition, and infrastructure noise.
 The measurement is this. The first SPRT-gated package (RFP + persistent
 search state + history aging) was claimed at +131 Elo by the internal
 self-play probes that gated it. An external gauntlet at 10+0.1 measured
-+75 (probe 0065). The 43% shrinkage is documented rather than explained
-away — and it is not yet resolved whether it comes from the self-play
-pool, from the time control, or from the false-green rate implied by
-running SPRTs at α=0.05.
++75 (probe 0065). A dedicated decomposition run (probe 0069) then split
+the 43% shrinkage: time control contributes ~0 (the package holds
++101 at 10+0.1 vs +100 at 8+0.08), ~31 Elo is chain non-additivity —
+summing sequential SPRT verdicts overstates the package they build,
+through patch interactions, early-stop bias, and the false-green rate
+of α=0.05 — and ~25 Elo is the self-play pool versus external anchors.
+The lesson is now house policy: packages are measured A/B as a whole;
+sums of individual verdicts are never quoted as strength claims.
 
 ## Facts
 
 - Language: Rust, single thread (for now), zero external crates
 - Evaluation: own NNUE `(768→128)x2→1`, trained from scratch on
   self-play data with Syzygy-filtered labels
-- Search: iterative deepening alpha-beta, TT, quiescence + QTT,
-  null-move pruning, LMR, RFP, persistent search state, killers/history
+- Search: iterative deepening alpha-beta, flat TT, quiescence + QTT
+  + SEE pruning, null-move pruning, LMR, RFP, persistent search state
+  with history aging, killers/history
 - Time management: non-uniform budget with soft/hard bounds
 - Born: May 2026 (Python prototypes), Rust core: July 2026
 

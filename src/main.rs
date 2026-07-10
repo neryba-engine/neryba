@@ -62,6 +62,9 @@ fn main() {
         "bench" => {
             let depth: i32 = args.get(2).and_then(|d| d.parse().ok()).unwrap_or(5);
             let mut total_nodes = 0u64;
+            let mut total_sing = 0u64;
+            let mut total_see_skips = 0u64;
+            let mut total_qchecks = 0u64;
             let t0 = Instant::now();
             for fen in BENCH_FENS {
                 let mut b = Board::from_fen(fen).expect("bench fen");
@@ -69,6 +72,9 @@ fn main() {
                 s.rep_keys = vec![b.key];
                 let (mv, score, d) = s.find_best_move(&mut b, depth, None);
                 total_nodes += s.nodes;
+                total_sing += s.sing_count;
+                total_see_skips += s.see_skips;
+                total_qchecks += s.qchecks_added;
                 println!(
                     "d{d} best={} score={score} nodes={}",
                     mv.map(|m| m.uci()).unwrap_or_default(),
@@ -77,6 +83,32 @@ fn main() {
             }
             let dt = t0.elapsed().as_secs_f64();
             println!("total {total_nodes} nodes  {:.3}s  {:.0} nps", dt, total_nodes as f64 / dt.max(1e-9));
+            if total_sing > 0 {
+                println!("singular extensions: {total_sing}"); // probe 0060, positive control
+            }
+            if total_see_skips > 0 {
+                println!("see skips: {total_see_skips}"); // probe 0061, positive control
+            }
+            if total_qchecks > 0 {
+                println!("qchecks added: {total_qchecks}"); // probe 0071
+            }
+        }
+        "seebatch" => {
+            // probe 0061: oracle channel — stdin "FEN;uci" → SEE
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let line = line.unwrap_or_default();
+                let mut it = line.splitn(2, ';');
+                let (fen, uci) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+                if fen.is_empty() || uci.is_empty() { continue; }
+                let mut b = match Board::from_fen(fen) { Ok(b) => b, Err(_) => { println!("ERR"); continue; } };
+                let mv = b.gen_legal().into_iter().find(|m| m.uci() == uci);
+                match mv {
+                    Some(m) => println!("{}", b.see(m)),
+                    None => println!("ILLEGAL"),
+                }
+            }
         }
         "eval" => {
             // probe 0010 invariant: direct eval parity vs sparring v3

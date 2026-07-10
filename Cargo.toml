@@ -14,3 +14,5 @@ codegen-units = 1
 [features]
 nnue_h512 = []
 nnue_h1024 = []
+# probe 0041 — Syzygy-augmented net (same arch 128, different data/labels).
+nnue_aug0041 = []

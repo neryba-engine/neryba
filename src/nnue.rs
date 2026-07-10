@@ -15,10 +15,16 @@ use std::sync::OnceLock;
 // probe 0040 (capacity lever): HIDDEN/net selected by cargo feature. Default
 // (no feature) = net-1 128, production UNTOUCHED. Features nnue_h512/nnue_h1024
 // are A/B binaries.
-#[cfg(all(not(feature = "nnue_h512"), not(feature = "nnue_h1024")))]
+#[cfg(all(not(feature = "nnue_h512"), not(feature = "nnue_h1024"), not(feature = "nnue_aug0041")))]
 pub const HIDDEN: usize = 128;
-#[cfg(all(not(feature = "nnue_h512"), not(feature = "nnue_h1024")))]
+#[cfg(all(not(feature = "nnue_h512"), not(feature = "nnue_h1024"), not(feature = "nnue_aug0041")))]
 const RAW: &[u8] = include_bytes!("nets/neryba1.bin");
+
+// probe 0041 — Syzygy-aug net: same arch and HIDDEN, only the weights differ.
+#[cfg(feature = "nnue_aug0041")]
+pub const HIDDEN: usize = 128;
+#[cfg(feature = "nnue_aug0041")]
+const RAW: &[u8] = include_bytes!("nets/neryba_aug0041.bin");
 
 #[cfg(feature = "nnue_h512")]
 pub const HIDDEN: usize = 512;

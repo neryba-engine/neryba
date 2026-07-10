@@ -3,3 +3,4 @@ target
 /neryba.exe
 src/nets/*.bin
 !src/nets/neryba1.bin
+.idea

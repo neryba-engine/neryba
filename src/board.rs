@@ -469,6 +469,91 @@ impl Board {
         s
     }
 
+
+    /// probe 0061: Static Exchange Evaluation — own derivation of the swap
+    /// algorithm (least-valuable-attacker iteratively; x-ray falls out
+    /// naturally via the occ mask). Value on the SEE_VAL scale from the
+    /// viewpoint of the side making capture m. Convention (mirroring the
+    /// python reference): promotion is not counted (attacker = pawn),
+    /// en passant — the victim is a pawn.
+    pub fn see(&self, m: Move) -> i32 {
+        const SEE_VAL: [i32; 7] = [0, 100, 320, 330, 500, 900, 10000];
+        let t = m.to as usize;
+        let mover = self.sq[m.from as usize];
+        let mut occ_all = (self.occ[0] | self.occ[1]) & !(1u64 << m.from);
+        // victim: en passant — the pawn behind to
+        let victim_val = if self.sq[t] != EMPTY {
+            SEE_VAL[ptype(self.sq[t]) as usize]
+        } else if ptype(mover) == PAWN && Some(m.to) == self.ep {
+            let cap_sq = if pcolor(mover) == WHITE { t - 8 } else { t + 8 };
+            occ_all &= !(1u64 << cap_sq);
+            SEE_VAL[PAWN as usize]
+        } else {
+            return 0; // not a capture — SEE outside the convention
+        };
+
+        // attackers of square t for side under the occ mask (x-ray via slider recompute)
+        let attackers = |side: u8, occ: u64| -> u64 {
+            let mut a = 0u64;
+            // pawns: attack t from the rank behind (from side's viewpoint)
+            let f = file_of(t as u8);
+            let r = rank_of(t as u8);
+            let dr: i8 = if side == WHITE { -1 } else { 1 };
+            for df in [-1i8, 1] {
+                let (nf, nr) = (f + df, r + dr);
+                if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                    a |= 1u64 << (nr * 8 + nf);
+                }
+            }
+            let mut set = (a & self.pieces[PAWN as usize])
+                | (KNIGHT_ATT[t] & self.pieces[KNIGHT as usize])
+                | (KING_ATT[t] & self.pieces[KING as usize]);
+            let diag = slider_attacks(t as u8, occ, true);
+            let orth = slider_attacks(t as u8, occ, false);
+            set |= diag & (self.pieces[BISHOP as usize] | self.pieces[QUEEN as usize]);
+            set |= orth & (self.pieces[ROOK as usize] | self.pieces[QUEEN as usize]);
+            set & self.occ[side as usize] & occ
+        };
+
+        let mut gain = [0i32; 32];
+        let mut d = 0usize;
+        gain[0] = victim_val;
+        let mut attacker_val = SEE_VAL[ptype(mover) as usize];
+        let mut side = pcolor(mover) ^ 1;
+        loop {
+            let atts = attackers(side, occ_all);
+            if atts == 0 {
+                break;
+            }
+            // least valuable attacker
+            let mut lva_sq = 64usize;
+            let mut lva_val = i32::MAX;
+            let mut s = atts;
+            while s != 0 {
+                let sq = s.trailing_zeros() as usize;
+                s &= s - 1;
+                let v = SEE_VAL[ptype(self.sq[sq]) as usize];
+                if v < lva_val {
+                    lva_val = v;
+                    lva_sq = sq;
+                }
+            }
+            d += 1;
+            if d >= 32 {
+                break;
+            }
+            gain[d] = attacker_val - gain[d - 1];
+            attacker_val = lva_val;
+            occ_all &= !(1u64 << lva_sq);
+            side ^= 1;
+        }
+        while d > 0 {
+            gain[d - 1] = -std::cmp::max(-gain[d - 1], gain[d]);
+            d -= 1;
+        }
+        gain[0]
+    }
+
     /// Is `t` attacked by side `by`?
     pub fn attacked(&self, t: u8, by: u8) -> bool {
         let f = file_of(t);

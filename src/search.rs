@@ -26,6 +26,34 @@ struct TtEntry {
     best: Option<Move>,
 }
 
+/// probe 0068 (env NERYBA_FLAT_TT): packed 16B slot.
+/// score: the mate range is encoded via ∓70_000 (PREREG addendum); flag=3 = empty.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct FlatSlot {
+    key: u64,
+    score: i16,
+    depth: i8,
+    flag: u8,
+    mv: [u8; 3],
+    _pad: u8,
+}
+const FLAT_EMPTY: u8 = 3;
+const FLAT_BITS: usize = 23;
+
+#[inline]
+fn pack_score(s: i32) -> i16 {
+    debug_assert!(s.abs() < 29_000 || s.abs() >= MATE_THRESHOLD, "score outside the packing convention: {}", s);
+    if s >= MATE_THRESHOLD { (s - 70_000) as i16 }
+    else if s <= -MATE_THRESHOLD { (s + 70_000) as i16 }
+    else { s as i16 }
+}
+#[inline]
+fn unpack_score(e: i16) -> i32 {
+    let v = e as i32;
+    if v >= 29_000 { v + 70_000 } else if v <= -29_000 { v - 70_000 } else { v }
+}
+
 pub struct Searcher {
     tt: HashMap<u64, TtEntry>,
     killers: [[Option<Move>; 2]; 64],
@@ -96,6 +124,26 @@ pub struct Searcher {
     /// (insufficient/stalemate leaf) get the same root-relative
     /// ±CONTEMPT as alpha_beta. off = 0-return, bit-for-bit.
     pub qcontempt: bool,
+    /// probe 0060 (env NERYBA_SINGULAR): singular extensions — +1 ply for
+    /// the TT move that alone holds the node (verification with exclusion).
+    /// off = the excluded path is dead, tree bit-for-bit.
+    pub singular: bool,
+    pub sing_min: i32,
+    pub sing_margin: i32,
+    pub sing_count: u64,
+    /// probe 0061 (env NERYBA_SEE_QS): skip SEE<0 captures in quiescence
+    /// (non-check nodes). off = bit-for-bit.
+    pub see_qs: bool,
+    pub see_skips: u64,
+    /// probe 0071 (env NERYBA_QCHECKS): quiet checks at qply 0 of quiescence.
+    pub qchecks: bool,
+    pub qchecks_added: u64,
+    /// probe 0068 (env NERYBA_FLAT_TT): flat array instead of the HashMap.
+    /// off = HashMap path bit-for-bit.
+    flat_on: bool,
+    flat_tt: Vec<FlatSlot>,
+    /// 0068 frame-F1: counter of cap-clear firings (bundle/structure attribution)
+    pub cap_clears: u64,
 }
 
 /// probe 0049: gravity history update (saturation, self-decay).
@@ -162,6 +210,26 @@ impl Searcher {
             hist_age: std::env::var("NERYBA_HIST_AGE_OFF").is_err(),
             hist2: std::env::var("NERYBA_HIST2").is_ok(),
             qcontempt: std::env::var("NERYBA_QCONTEMPT").is_ok(),
+            singular: std::env::var("NERYBA_SINGULAR").is_ok(),
+            sing_min: std::env::var("NERYBA_SING_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(7),
+            sing_margin: std::env::var("NERYBA_SING_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+            sing_count: 0,
+            // probe 0061 GREEN (+44.9 SPRT accept @1104 — research/0061-see-
+            // pruning/VERDICT.md): SEE-qs default-on; OFF — ablation
+            see_qs: std::env::var("NERYBA_SEE_QS_OFF").is_err()
+                && std::env::var("NERYBA_EXACT").is_err(),
+            see_skips: 0,
+            qchecks: std::env::var("NERYBA_QCHECKS").is_ok(),
+            qchecks_added: 0,
+            // probe 0068 GREEN (+17.4 STC ACCEPT + LTC sign +27.9 —
+            // research/0068-flat-tt/VERDICT.md): flat-TT default-on
+            flat_on: std::env::var("NERYBA_FLAT_TT_OFF").is_err(),
+            flat_tt: if std::env::var("NERYBA_FLAT_TT_OFF").is_err() {
+                vec![FlatSlot { key: 0, score: 0, depth: 0, flag: FLAT_EMPTY, mv: [0; 3], _pad: 0 }; 1 << FLAT_BITS]
+            } else {
+                Vec::new()
+            },
+            cap_clears: 0,
         }
     }
 
@@ -176,6 +244,52 @@ impl Searcher {
     #[inline]
     fn put_buf(&mut self, ply: usize, v: Vec<Move>) {
         self.bufs[ply] = v;
+    }
+
+    /// probe 0068: unified probe over both TT backends.
+    #[inline]
+    fn tt_probe(&self, key: u64) -> Option<(i32, u8, i32, Option<Move>)> {
+        if self.flat_on {
+            let s = &self.flat_tt[(key as usize) & ((1 << FLAT_BITS) - 1)];
+            if s.flag != FLAT_EMPTY && s.key == key {
+                let best = if s.mv == [0; 3] { None } else {
+                    Some(Move { from: s.mv[0], to: s.mv[1], promo: s.mv[2] })
+                };
+                return Some((s.depth as i32, s.flag, unpack_score(s.score), best));
+            }
+            None
+        } else {
+            self.tt.get(&key).map(|e| (e.depth, e.flag, e.score, e.best))
+        }
+    }
+
+    /// probe 0068: unified store (flat = always-replace).
+    #[inline]
+    fn tt_store(&mut self, key: u64, depth: i32, flag: u8, score: i32, best: Option<Move>) {
+        if self.flat_on {
+            let idx = (key as usize) & ((1 << FLAT_BITS) - 1);
+            let mv = best.map(|m| [m.from, m.to, m.promo]).unwrap_or([0; 3]);
+            self.flat_tt[idx] = FlatSlot {
+                key, score: pack_score(score), depth: depth as i8, flag, mv, _pad: 0,
+            };
+        } else {
+            self.tt.insert(key, TtEntry { depth, flag, score, best });
+        }
+    }
+
+    #[inline]
+    fn tt_clear_all(&mut self) {
+        if self.flat_on {
+            self.flat_tt.iter_mut().for_each(|s| s.flag = FLAT_EMPTY);
+        } else {
+            self.tt.clear();
+        }
+    }
+
+    #[inline]
+    fn tt_over_cap(&self) -> bool {
+        // flat: natural eviction, the cap does not apply (PREREG 0068)
+        !self.flat_on && self.tt.len() > self.persist_cap
     }
 
     fn reset_ordering(&mut self) {
@@ -257,7 +371,7 @@ impl Searcher {
         self.rep_keys.iter().filter(|&&k| k == key).count() >= 2
     }
 
-    fn quiescence(&mut self, b: &mut Board, mut alpha: i32, beta: i32, ply: i32) -> i32 {
+    fn quiescence(&mut self, b: &mut Board, mut alpha: i32, beta: i32, ply: i32, qply: i32) -> i32 {
         self.check_time();
         if self.stop {
             return alpha;
@@ -268,14 +382,14 @@ impl Searcher {
         // with depth>=0 always qualify). Mate scores rebased as usual.
         let alpha_orig = alpha;
         if self.qtt_enabled {
-            if let Some(e) = self.tt.get(&b.key) {
-                let mut score = e.score;
+            if let Some((_qd, q_flag, q_score, _qb)) = self.tt_probe(b.key) {
+                let mut score = q_score;
                 if score >= MATE_THRESHOLD {
                     score -= ply;
                 } else if score <= -MATE_THRESHOLD {
                     score += ply;
                 }
-                match e.flag {
+                match q_flag {
                     EXACT => return score,
                     LOWER => {
                         if score >= beta {
@@ -323,14 +437,40 @@ impl Searcher {
             if stand_pat > alpha {
                 alpha = stand_pat;
             }
-            moves.retain(|&m| Self::is_capture(b, m));
+            if self.qchecks && qply == 0 {
+                // probe 0071: captures + quiet checks (make-filter, qply 0 only)
+                let mut keep = Vec::with_capacity(moves.len());
+                for &m in moves.iter() {
+                    if Self::is_capture(b, m) {
+                        keep.push(m);
+                    } else if m.promo == 0 {
+                        let undo = b.make(m);
+                        let gives = b.in_check();
+                        b.unmake(m, undo);
+                        if gives {
+                            keep.push(m);
+                            self.qchecks_added += 1;
+                        }
+                    }
+                }
+                moves.clear();
+                moves.extend_from_slice(&keep);
+            } else {
+                moves.retain(|&m| Self::is_capture(b, m));
+            }
             moves.sort_by_key(|&m| -Self::mvv_lva(b, m));
         }
         let mut result = None;
+        let evasion = b.in_check();
         for &m in moves.iter() {
+            // probe 0061: a losing capture at a quiet node — skip (PREREG)
+            if self.see_qs && !evasion && Self::is_capture(b, m) && b.see(m) < 0 {
+                self.see_skips += 1;
+                continue;
+            }
             let undo = b.make(m);
             self.rep_keys.push(b.key);
-            let score = -self.quiescence(b, -beta, -alpha, ply + 1);
+            let score = -self.quiescence(b, -beta, -alpha, ply + 1, qply + 1);
             self.rep_keys.pop();
             b.unmake(m, undo);
             if score >= beta {
@@ -360,8 +500,8 @@ impl Searcher {
         if !self.qtt_enabled || self.stop {
             return;
         }
-        if let Some(e) = self.tt.get(&key) {
-            if e.depth > 0 {
+        if let Some((e_depth, _f, _s, _b)) = self.tt_probe(key) {
+            if e_depth > 0 {
                 return; // deeper info wins
             }
         }
@@ -371,10 +511,10 @@ impl Searcher {
         } else if s <= -MATE_THRESHOLD {
             s -= ply;
         }
-        self.tt.insert(key, TtEntry { depth: 0, flag, score: s, best: None });
+        self.tt_store(key, 0, flag, s, None);
     }
 
-    fn alpha_beta(&mut self, b: &mut Board, mut depth: i32, mut alpha: i32, mut beta: i32, ply: i32, prev: Option<usize>) -> i32 {
+    fn alpha_beta(&mut self, b: &mut Board, mut depth: i32, mut alpha: i32, mut beta: i32, ply: i32, prev: Option<usize>, excluded: Option<Move>) -> i32 {
         self.check_time();
         if self.stop {
             return alpha;
@@ -400,17 +540,25 @@ impl Searcher {
 
         let key = b.key;
         let mut tt_move = None;
-        if let Some(e) = self.tt.get(&key) {
-            tt_move = e.best;
-            if e.depth >= depth {
+        let mut tt_depth = -1;
+        let mut tt_flag = UPPER;
+        let mut tt_score_raw = 0;
+        // probe 0060: during excluded verification the TT is neither read
+        // (cutoff/narrow) nor written — the sub-search verdict does not belong to the node key
+        if excluded.is_none() { if let Some((e_depth, e_flag, e_score, e_best)) = self.tt_probe(key) {
+            tt_move = e_best;
+            tt_depth = e_depth;
+            tt_flag = e_flag;
+            tt_score_raw = e_score;
+            if e_depth >= depth {
                 // mate scores are stored node-relative; rebase to this ply
-                let mut score = e.score;
+                let mut score = e_score;
                 if score >= MATE_THRESHOLD {
                     score -= ply;
                 } else if score <= -MATE_THRESHOLD {
                     score += ply;
                 }
-                match e.flag {
+                match e_flag {
                     EXACT => return score,
                     LOWER => {
                         if score > alpha {
@@ -427,7 +575,7 @@ impl Searcher {
                     return score;
                 }
             }
-        }
+        } }
         // probe 0046 (env NERYBA_IIR): a node without a TT move has the
         // worst ordering — reduce depth (classic IIR form, conditions in PREREG)
         if self.iir_enabled && depth >= self.iir_min && tt_move.is_none() {
@@ -447,7 +595,7 @@ impl Searcher {
         if depth == 0 {
             // return the buffer BEFORE quiescence re-borrows the same ply slot
             self.put_buf(ply as usize, moves);
-            return self.quiescence(b, alpha, beta, ply);
+            return self.quiescence(b, alpha, beta, ply, 0);
         }
 
         let in_check = b.in_check();
@@ -471,7 +619,7 @@ impl Searcher {
             let saved = b.make_null();
             self.rep_keys.push(b.key);
             // 0043: after a null move there is no prev (conthist chain breaks)
-            let null_score = -self.alpha_beta(b, depth - 3, -beta, -beta + 1, ply + 1, None);
+            let null_score = -self.alpha_beta(b, depth - 3, -beta, -beta + 1, ply + 1, None, None);
             self.rep_keys.pop();
             b.unmake_null(saved);
             if null_score >= beta {
@@ -481,12 +629,39 @@ impl Searcher {
 
         self.order_moves(b, &mut moves, tt_move, ply as usize, prev);
 
+        // probe 0060 (env NERYBA_SINGULAR): verification with exclusion —
+        // conditions and constants fixed in the PREREG
+        let mut sing_ext = 0;
+        if self.singular
+            && excluded.is_none()
+            && ply > 0
+            && depth >= self.sing_min
+            && tt_move.is_some()
+            && tt_depth >= depth - 3
+            && (tt_flag == LOWER || tt_flag == EXACT)
+        {
+            let mut ts = tt_score_raw;
+            if ts >= MATE_THRESHOLD { ts -= ply; } else if ts <= -MATE_THRESHOLD { ts += ply; }
+            if ts.abs() < MATE_THRESHOLD {
+                let s_beta = ts - self.sing_margin * depth;
+                let v = self.alpha_beta(b, (depth - 1) / 2, s_beta - 1, s_beta, ply, prev, tt_move);
+                if !self.stop && v < s_beta {
+                    sing_ext = 1;
+                    self.sing_count += 1;
+                }
+            }
+        }
+
         let mut best = -INF;
         let mut best_move = None;
         let mut move_count = 0;
         for mi in 0..moves.len() {
             let m = moves[mi];
+            if Some(m) == excluded {
+                continue; // probe 0060: the excluded move stays outside the counters
+            }
             move_count += 1;
+            let m_ext = if sing_ext > 0 && Some(m) == tt_move { sing_ext } else { 0 };
             let is_cap = Self::is_capture(b, m);
             // probe 0045 (env NERYBA_LMP): late quiet at a non-PV node — skip
             // (continue, not break: captures later in the list are still tried)
@@ -510,7 +685,7 @@ impl Searcher {
             };
 
             let score = if move_count == 1 {
-                -self.alpha_beta(b, depth - 1, -beta, -alpha, ply + 1, child_prev)
+                -self.alpha_beta(b, depth - 1 + m_ext, -beta, -alpha, ply + 1, child_prev, None)
             } else {
                 let mut reduction = 0;
                 if self.lmr_enabled && depth >= 3 && move_count >= 4 && !is_cap && !gives_check && m.promo == 0 && !in_check {
@@ -525,12 +700,12 @@ impl Searcher {
                     };
                 }
                 let mut s =
-                    -self.alpha_beta(b, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, child_prev);
+                    -self.alpha_beta(b, depth - 1 + m_ext - reduction, -alpha - 1, -alpha, ply + 1, child_prev, None);
                 if reduction > 0 && s > alpha {
-                    s = -self.alpha_beta(b, depth - 1, -alpha - 1, -alpha, ply + 1, child_prev);
+                    s = -self.alpha_beta(b, depth - 1 + m_ext, -alpha - 1, -alpha, ply + 1, child_prev, None);
                 }
                 if alpha < s && s < beta {
-                    s = -self.alpha_beta(b, depth - 1, -beta, -alpha, ply + 1, child_prev);
+                    s = -self.alpha_beta(b, depth - 1 + m_ext, -beta, -alpha, ply + 1, child_prev, None);
                 }
                 s
             };
@@ -591,7 +766,7 @@ impl Searcher {
         }
         self.put_buf(ply as usize, moves);
 
-        if !self.stop {
+        if !self.stop && excluded.is_none() {
             let flag = if best <= alpha_orig {
                 UPPER
             } else if best >= beta {
@@ -606,7 +781,7 @@ impl Searcher {
             } else if tt_score <= -MATE_THRESHOLD {
                 tt_score -= ply;
             }
-            self.tt.insert(key, TtEntry { depth, flag, score: tt_score, best: best_move });
+            self.tt_store(key, depth, flag, tt_score, best_move);
         }
         best
     }
@@ -639,7 +814,7 @@ impl Searcher {
             } else {
                 None
             };
-            let score = -self.alpha_beta(b, depth - 1, -beta, -alpha, 1, child_prev);
+            let score = -self.alpha_beta(b, depth - 1, -beta, -alpha, 1, child_prev, None);
             self.rep_keys.pop();
             b.unmake(m, undo);
             if self.stop {
@@ -679,8 +854,11 @@ impl Searcher {
     ) -> (Option<Move>, i32, i32) {
         // probe 0055 (env NERYBA_PERSIST): state lives across game moves;
         // cap-clear — backstop against TT bloat (PREREG 0055)
-        if !self.persist_enabled || self.tt.len() > self.persist_cap {
-            self.tt.clear();
+        if !self.persist_enabled || self.tt_over_cap() {
+            if self.tt_over_cap() {
+                self.cap_clears += 1; // 0068-F1: measurable attribution
+            }
+            self.tt_clear_all();
             self.reset_ordering();
         } else if self.hist_age {
             // probe 0057: decay history + reset ply-relative killers
@@ -818,7 +996,7 @@ impl Searcher {
             };
             out.push(m.uci());
             work.make(m);
-            mv = self.tt.get(&work.key).and_then(|e| e.best);
+            mv = self.tt_probe(work.key).and_then(|(_d, _f, _s, b)| b);
         }
         out
     }

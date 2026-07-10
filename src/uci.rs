@@ -120,6 +120,9 @@ pub fn run() {
                     ((d as i32).clamp(1, MAX_DEPTH), None, None)
                 } else if let Some(&mt) = args.get("movetime") {
                     (MAX_DEPTH, Some(mt as f64 / 1000.0), None)
+                } else if args.contains_key("nodes") {
+                    // probe 0070: the node limit drives the stop — depth wide open
+                    (MAX_DEPTH, None, None)
                 } else if let Some(t) = budget_seconds(&args, st.board.stm) {
                     if tm3 {
                         // TM1 base; opening discount ×0.5 (fullmove ≤ 10);
@@ -141,9 +144,17 @@ pub fn run() {
                 };
 
                 let searcher = &mut st.searcher;
+                // probe 0070: `go nodes N` -> node_limit (the core had it from the
+                // datagen path, UCI never wired it). Resetting it every move is
+                // mandatory: the persist Searcher (0055) lives across moves.
+                searcher.node_limit = args.get("nodes").map(|&n| n as u64);
                 searcher.rep_keys = st.keys.clone();
                 let mut b = st.board.clone();
                 let (mv, score, reached) = searcher.find_best_move_tm(&mut b, depth, movetime, hard);
+                if st.searcher.cap_clears > 0 {
+                    let _ = writeln!(out, "info string capclears {}", st.searcher.cap_clears);
+                }
+                let searcher = &mut st.searcher;
                 if searcher.tm3_extended {
                     let _ = writeln!(out, "info string tm3 extend"); // positive control for 0025
                 }
