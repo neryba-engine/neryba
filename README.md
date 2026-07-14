@@ -15,7 +15,10 @@
 Neryba is an original chess engine written in Rust, grown exclusively
 through pre-registered experiments: no line of code enters the engine
 without a measured, committed-in-advance verdict behind it. Zero
-borrowed code, zero dependencies — the *not-a-clone* principle is baked
+borrowed code: no line of source from another engine has entered this
+repository. The Rust engine has no external crates. The offline
+kitchen — data generation, Syzygy label filtering, NNUE training — uses
+python-chess and PyTorch openly. The *not-a-clone* principle is baked
 into the name.
 
 Every change is gated by a pre-registered SPRT; the experiment log —
@@ -52,7 +55,8 @@ sums of individual verdicts are never quoted as strength claims.
 
 - Language: Rust, single thread (for now), zero external crates
 - Evaluation: own NNUE `(768→128)x2→1`, trained from scratch on
-  self-play data with Syzygy-filtered labels
+  self-play data with Syzygy-filtered labels (filtered offline via
+  python-chess; the engine does no tablebase probing at runtime)
 - Search: iterative deepening alpha-beta, flat TT, quiescence + QTT
   + SEE pruning, null-move pruning, LMR, RFP, persistent search state
   with history aging, killers/history
@@ -66,9 +70,12 @@ cargo build --release
 ./target/release/neryba bench 5
 ```
 
-The production NNUE weights (`src/nets/neryba1.bin`, ~190K, trained on
+The production NNUE weights (`src/nets/neryba2.bin`, ~190K, trained on
 the engine's own self-play data) are included — the repository builds
-out of the box.
+out of the box. net-2 (probe 0085) is a retrain of the same `(768→128)x2→1`
+architecture on stronger self-play labels; it beats the previous net-1 by
++166/+188 Elo in self-play (bullet / long TC) — a relative, internal number,
+not an external rating.
 
 ## License
 

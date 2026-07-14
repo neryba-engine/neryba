@@ -13,12 +13,13 @@ use std::num::Wrapping;
 use std::sync::OnceLock;
 
 // probe 0040 (capacity lever): HIDDEN/net selected by cargo feature. Default
-// (no feature) = net-1 128, production UNTOUCHED. Features nnue_h512/nnue_h1024
-// are A/B binaries.
+// (no feature) = net-2 128 (probe 0085 flywheel: net-2 retrained on stronger
+// self-play labels, +166/+188 self-play over net-1; production net since
+// 2026-07-14). Features nnue_h512/nnue_h1024 are A/B binaries.
 #[cfg(all(not(feature = "nnue_h512"), not(feature = "nnue_h1024"), not(feature = "nnue_aug0041")))]
 pub const HIDDEN: usize = 128;
 #[cfg(all(not(feature = "nnue_h512"), not(feature = "nnue_h1024"), not(feature = "nnue_aug0041")))]
-const RAW: &[u8] = include_bytes!("nets/neryba1.bin");
+const RAW: &[u8] = include_bytes!("nets/neryba2.bin");
 
 // probe 0041 — Syzygy-aug net: same arch and HIDDEN, only the weights differ.
 #[cfg(feature = "nnue_aug0041")]
