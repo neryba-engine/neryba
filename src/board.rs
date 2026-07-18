@@ -208,7 +208,8 @@ pub struct Board {
     /// per-piece-type bitboards, both colours merged (probe 0012);
     /// colour resolved by intersecting with occ[c]. Index by ptype 1..=6.
     pub pieces: [u64; 7],
-    king: [u8; 2],
+    /// king squares [white, black] (probe 0090: the king input bucket reads them in nnue).
+    pub king: [u8; 2],
     /// probe 0032: color-indexed NNUE accumulators (White-persp, Black-persp),
     /// maintained in make/unmake (delta update in make, snapshot rollback in unmake)
     pub acc: crate::nnue::Acc,
@@ -238,7 +239,7 @@ impl Board {
             occ: [0, 0],
             pieces: [0; 7],
             king: [64, 64],
-            acc: [[0i32; crate::nnue::HIDDEN]; 2],
+            acc: [[0i16; crate::nnue::HIDDEN]; 2], // probe 0093: i16 layout
         };
         let mut r: i8 = 7;
         let mut f: i8 = 0;
@@ -295,7 +296,7 @@ impl Board {
         b.key = b.compute_key();
         b.occ = b.compute_occ();
         b.pieces = b.compute_pieces();
-        b.acc = crate::nnue::refresh(&b.sq, b.occ[0] | b.occ[1]); // probe 0032
+        b.acc = crate::nnue::refresh(&b.sq, b.occ[0] | b.occ[1], b.king); // probe 0032
         Ok(b)
     }
 
@@ -866,15 +867,15 @@ impl Board {
             k ^= piece_key(pcolor(undo.cap), ptype(undo.cap), undo.cap_sq);
             self.occ[pcolor(undo.cap) as usize] &= !(1u64 << undo.cap_sq);
             self.pieces[ptype(undo.cap) as usize] &= !(1u64 << undo.cap_sq);
-            crate::nnue::sub_piece(&mut self.acc, pcolor(undo.cap), ptype(undo.cap) - 1, undo.cap_sq);
+            crate::nnue::sub_piece(&mut self.acc, pcolor(undo.cap), ptype(undo.cap) - 1, undo.cap_sq, self.king);
         }
         self.sq[undo.cap_sq as usize] = EMPTY;
 
         let placed = if m.promo != 0 { make_piece(us, m.promo) } else { p };
         k ^= piece_key(us, ptype(p), m.from);
         k ^= piece_key(us, ptype(placed), m.to);
-        crate::nnue::sub_piece(&mut self.acc, us, ptype(p) - 1, m.from);
-        crate::nnue::add_piece(&mut self.acc, us, ptype(placed) - 1, m.to);
+        crate::nnue::sub_piece(&mut self.acc, us, ptype(p) - 1, m.from, self.king);
+        crate::nnue::add_piece(&mut self.acc, us, ptype(placed) - 1, m.to, self.king);
         self.sq[m.from as usize] = EMPTY;
         self.sq[m.to as usize] = placed;
         self.occ[us as usize] =
@@ -894,8 +895,8 @@ impl Board {
                     (self.occ[us as usize] & !(1u64 << (m.to + 1))) | (1u64 << (m.to - 1));
                 self.pieces[ROOK as usize] =
                     (self.pieces[ROOK as usize] & !(1u64 << (m.to + 1))) | (1u64 << (m.to - 1));
-                crate::nnue::sub_piece(&mut self.acc, us, ROOK - 1, m.to + 1);
-                crate::nnue::add_piece(&mut self.acc, us, ROOK - 1, m.to - 1);
+                crate::nnue::sub_piece(&mut self.acc, us, ROOK - 1, m.to + 1, self.king);
+                crate::nnue::add_piece(&mut self.acc, us, ROOK - 1, m.to - 1, self.king);
             } else if d == -2 {
                 // O-O-O: rook a->d
                 self.sq[(m.to - 2) as usize] = EMPTY;
@@ -905,8 +906,16 @@ impl Board {
                     (self.occ[us as usize] & !(1u64 << (m.to - 2))) | (1u64 << (m.to + 1));
                 self.pieces[ROOK as usize] =
                     (self.pieces[ROOK as usize] & !(1u64 << (m.to - 2))) | (1u64 << (m.to + 1));
-                crate::nnue::sub_piece(&mut self.acc, us, ROOK - 1, m.to - 2);
-                crate::nnue::add_piece(&mut self.acc, us, ROOK - 1, m.to + 1);
+                crate::nnue::sub_piece(&mut self.acc, us, ROOK - 1, m.to - 2, self.king);
+                crate::nnue::add_piece(&mut self.acc, us, ROOK - 1, m.to + 1, self.king);
+            }
+            // probe 0090 (Option 1): a king move changes bucket/mirror -> full refresh
+            // of both perspectives (the incremental deltas above get overwritten).
+            // NUM_KB=1 -> refresh is byte-identical, so the default net is unchanged
+            // (just an extra recompute on a king move; only nnue_kbuckets enables it).
+            #[cfg(feature = "nnue_kbuckets")]
+            {
+                self.acc = crate::nnue::refresh(&self.sq, self.occ[0] | self.occ[1], self.king);
             }
         }
 
@@ -938,7 +947,8 @@ impl Board {
         debug_assert_eq!(self.occ, self.compute_occ());
         debug_assert_eq!(self.pieces, self.compute_pieces());
         // probe 0032 oracle: incremental accumulator == fresh recompute
-        debug_assert_eq!(self.acc, crate::nnue::refresh(&self.sq, self.occ[0] | self.occ[1]));
+        // (probe 0090: now also validates the king input bucket — refresh takes self.king)
+        debug_assert_eq!(self.acc, crate::nnue::refresh(&self.sq, self.occ[0] | self.occ[1], self.king));
         undo
     }
 

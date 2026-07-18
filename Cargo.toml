@@ -9,10 +9,17 @@ license = "AGPL-3.0-or-later"
 lto = true
 codegen-units = 1
 
-# Capacity A/B builds (default = production net, HIDDEN=128).
+# Capacity A/B builds (default = production net-0063, HIDDEN=128).
 # Mutually exclusive; enable exactly one, if any.
 [features]
 nnue_h512 = []
 nnue_h1024 = []
+# probe 0063 — output buckets: PROMOTED to default 2026-07-17 (feature removed).
+# probe 0090 — king input buckets (prong B): output buckets + 10 king buckets.
+nnue_kbuckets = []
+# probe 0094 — prong C: two-layer output head 256->16->1 over 8 output buckets.
+nnue_l2 = []
+# probe 0095 — i8 requant of fw/fb/ob (1/64 grid) of net-0063.
+nnue_i8 = []
 # probe 0041 — Syzygy-augmented net (same arch 128, different data/labels).
 nnue_aug0041 = []

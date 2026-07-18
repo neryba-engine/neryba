@@ -897,6 +897,9 @@ impl Searcher {
 
         let mut best: (Option<Move>, i32, i32) = (None, 0, 0);
         let mut prev_best: Option<Move> = None; // best of the completed d-1 iteration
+        // probe 0087 (PREREG addendum B): per-iteration info for the label generator.
+        // Output-only, default OFF — tree/nodes untouched (bit-exact bench gate).
+        let iter_info = std::env::var("NERYBA_ITER_INFO").is_ok();
         for d in 1..=max_depth {
             let window = if aspiration && d >= 4 && best.0.is_some() {
                 (best.1 - ASP, best.1 + ASP)
@@ -935,6 +938,22 @@ impl Searcher {
             if mv.is_some() {
                 prev_best = best.0;
                 best = (mv, score, d);
+                if iter_info {
+                    let ss = if score.abs() >= MATE_THRESHOLD {
+                        let plies = MATE - score.abs();
+                        let mm = std::cmp::max(1, (plies + 1) / 2);
+                        format!("mate {}", if score > 0 { mm } else { -mm })
+                    } else {
+                        format!("cp {score}")
+                    };
+                    println!(
+                        "info depth {} score {} nodes {} pv {}",
+                        d,
+                        ss,
+                        self.nodes,
+                        mv.map(|m| m.uci()).unwrap_or_default()
+                    );
+                }
             }
             // TM4 (0038): best stable for ≥STAB iterations in the draw zone at
             // depth ≥MIN_D → stop (unspent soft = increment bank)

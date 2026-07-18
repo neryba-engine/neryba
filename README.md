@@ -54,9 +54,11 @@ sums of individual verdicts are never quoted as strength claims.
 ## Facts
 
 - Language: Rust, single thread (for now), zero external crates
-- Evaluation: own NNUE `(768→128)x2→1`, trained from scratch on
-  self-play data with Syzygy-filtered labels (filtered offline via
-  python-chess; the engine does no tablebase probing at runtime)
+- Evaluation: own NNUE `(768→128)x2→1` with 8 phase-conditioned output
+  buckets (probe 0063) and an i16 SIMD-dense layout (probe 0093,
+  +12% NPS bit-exact), trained from scratch on self-play data with
+  Syzygy-filtered labels (filtered offline via python-chess; the engine
+  does no tablebase probing at runtime)
 - Search: iterative deepening alpha-beta, flat TT, quiescence + QTT
   + SEE pruning, null-move pruning, LMR, RFP, persistent search state
   with history aging, killers/history
@@ -70,12 +72,15 @@ cargo build --release
 ./target/release/neryba bench 5
 ```
 
-The production NNUE weights (`src/nets/neryba2.bin`, ~190K, trained on
-the engine's own self-play data) are included — the repository builds
-out of the box. net-2 (probe 0085) is a retrain of the same `(768→128)x2→1`
-architecture on stronger self-play labels; it beats the previous net-1 by
-+166/+188 Elo in self-play (bullet / long TC) — a relative, internal number,
-not an external rating.
+The production NNUE weights (`src/nets/neryba0063.bin`, ~196K, trained
+on the engine's own self-play data) are included — the repository builds
+out of the box. net-0063 (probe 0063, production since 2026-07-17) adds
+8 phase-conditioned output buckets on top of the net-2 flywheel weights
+(probe 0085, also included); it beats net-2 by +10.9 Elo in the SPRT
+deploy gate — a relative, internal number, not an external rating. An
+external gauntlet of the *previous* stack (net-2, probe 0089) measured
+≈2761 CCRL-anchored; the current stack has not been externally measured
+yet.
 
 ## License
 

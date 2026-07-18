@@ -200,7 +200,8 @@ pub fn evaluate(b: &Board) -> i32 {
     // The flag is cached once per process (per-node env read would be costly).
     if nnue_on() {
         // probe 0032: accumulator is already up to date (make/unmake) → output layer only
-        let stm = nnue::eval_acc(&b.acc, b.stm);
+        // probe 0063: piece count selects the phase output bucket
+        let stm = nnue::eval_acc(&b.acc, b.stm, (b.occ[0] | b.occ[1]).count_ones());
         return if b.stm == WHITE { stm } else { -stm };
     }
 

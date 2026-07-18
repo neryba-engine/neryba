@@ -4,4 +4,5 @@ target
 src/nets/*.bin
 !src/nets/neryba1.bin
 !src/nets/neryba2.bin
+!src/nets/neryba0063.bin
 .idea
