@@ -65,6 +65,14 @@ sums of individual verdicts are never quoted as strength claims.
 - Time management: non-uniform budget with soft/hard bounds
 - Born: May 2026 (Python prototypes), Rust core: July 2026
 
+## Versions
+
+Each published snapshot carries a version (`Cargo.toml`, echoed in
+`uci` → `id name`); tags `vX.Y.Z` mark them in this repository. MINOR
+bumps on every strength-changing deployment, PATCH on non-playing
+changes. Production weights are attached to the matching GitHub release.
+Current: **0.5.0** — the buckets+i16 stack.
+
 ## Building
 
 ```

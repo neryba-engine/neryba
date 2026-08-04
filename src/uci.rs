@@ -88,7 +88,8 @@ pub fn run() {
         };
         match cmd {
             "uci" => {
-                let _ = writeln!(out, "id name Neryba 0.0.1");
+                // version comes from Cargo.toml — single source (publication rule 2026-08-04)
+                let _ = writeln!(out, "id name Neryba {}", env!("CARGO_PKG_VERSION"));
                 let _ = writeln!(out, "id author Dmytro Dehtiarov");
                 let _ = writeln!(out, "uciok");
             }
