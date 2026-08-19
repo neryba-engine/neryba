@@ -98,6 +98,18 @@ pub struct Searcher {
     pub rfp_enabled: bool,
     pub rfp_margin: i32,
     pub rfp_depth: i32,
+    /// probe 0161 GREEN (+24.4 [+6.95, +41.90] @1000 at prod TC 180+2;
+    /// screening +61.1 @868 SPRT accept): razoring — the mirror image of
+    /// RFP on the other side of the window. RFP prunes a node that is too
+    /// GOOD for the window (fail-high); razoring takes one that is too BAD
+    /// (fail-low) and does not prune blindly: it drops into quiescence and
+    /// returns only what quiescence confirms. Default-on;
+    /// `NERYBA_RAZOR_OFF` is the ablation knob (same pattern as RFP 0044,
+    /// persist 0055, SEE-qs 0061). Constants are fixed by the PREREG and
+    /// were not tuned.
+    pub razor_enabled: bool,
+    pub razor_margin: i32,
+    pub razor_depth: i32,
     /// probe 0046 (env NERYBA_IIR): internal iterative reductions —
     /// depth−1 at nodes without a TT move. off = tree bit-for-bit unchanged.
     pub iir_enabled: bool,
@@ -109,9 +121,6 @@ pub struct Searcher {
     pub persist_cap: usize,
     /// probe 0045 (env NERYBA_LMP): late move pruning — skip late quiets
     /// at non-PV nodes once movecount ≥ BASE + MUL·depth². off = bit-for-bit.
-    pub lmp_enabled: bool,
-    pub lmp_base: f64,
-    pub lmp_mul: f64,
     /// probe 0057 (env NERYBA_HIST_AGE): in persist mode, history ÷2 +
     /// killers clear on search entry (fresh outweighs stale). off = full
     /// persist as in 0055.
@@ -136,8 +145,6 @@ pub struct Searcher {
     pub see_qs: bool,
     pub see_skips: u64,
     /// probe 0071 (env NERYBA_QCHECKS): quiet checks at qply 0 of quiescence.
-    pub qchecks: bool,
-    pub qchecks_added: u64,
     /// probe 0068 (env NERYBA_FLAT_TT): flat array instead of the HashMap.
     /// off = HashMap path bit-for-bit.
     flat_on: bool,
@@ -195,6 +202,9 @@ impl Searcher {
                 && std::env::var("NERYBA_EXACT").is_err(),
             rfp_margin: std::env::var("NERYBA_RFP_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(100),
             rfp_depth: std::env::var("NERYBA_RFP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(6),
+            razor_enabled: std::env::var("NERYBA_RAZOR_OFF").is_err(),
+            razor_margin: std::env::var("NERYBA_RAZOR_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(200),
+            razor_depth: std::env::var("NERYBA_RAZOR_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
             iir_enabled: std::env::var("NERYBA_IIR").is_ok(),
             iir_min: std::env::var("NERYBA_IIR_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
             // probe 0055 GREEN (+27.6 Elo SPRT accept @1844 — research/0055-
@@ -202,9 +212,6 @@ impl Searcher {
             // NERYBA_PERSIST_OFF — ablation knob (A/B with the same binary)
             persist_enabled: std::env::var("NERYBA_PERSIST_OFF").is_err(),
             persist_cap: std::env::var("NERYBA_PERSIST_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(4_000_000),
-            lmp_enabled: std::env::var("NERYBA_LMP").is_ok(),
-            lmp_base: std::env::var("NERYBA_LMP_BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0),
-            lmp_mul: std::env::var("NERYBA_LMP_MUL").ok().and_then(|v| v.parse().ok()).unwrap_or(1.3),
             // probe 0057 GREEN (+12.8 SPRT accept @4618 — research/0057-
             // history-aging/VERDICT.md): aging default-on; OFF — ablation
             hist_age: std::env::var("NERYBA_HIST_AGE_OFF").is_err(),
@@ -219,8 +226,6 @@ impl Searcher {
             see_qs: std::env::var("NERYBA_SEE_QS_OFF").is_err()
                 && std::env::var("NERYBA_EXACT").is_err(),
             see_skips: 0,
-            qchecks: std::env::var("NERYBA_QCHECKS").is_ok(),
-            qchecks_added: 0,
             // probe 0068 GREEN (+17.4 STC ACCEPT + LTC sign +27.9 —
             // research/0068-flat-tt/VERDICT.md): flat-TT default-on
             flat_on: std::env::var("NERYBA_FLAT_TT_OFF").is_err(),
@@ -437,25 +442,7 @@ impl Searcher {
             if stand_pat > alpha {
                 alpha = stand_pat;
             }
-            if self.qchecks && qply == 0 {
-                // probe 0071: captures + quiet checks (make-filter, qply 0 only)
-                let mut keep = Vec::with_capacity(moves.len());
-                for &m in moves.iter() {
-                    if Self::is_capture(b, m) {
-                        keep.push(m);
-                    } else if m.promo == 0 {
-                        let undo = b.make(m);
-                        let gives = b.in_check();
-                        b.unmake(m, undo);
-                        if gives {
-                            keep.push(m);
-                            self.qchecks_added += 1;
-                        }
-                    }
-                }
-                moves.clear();
-                moves.extend_from_slice(&keep);
-            } else {
+            {
                 moves.retain(|&m| Self::is_capture(b, m));
             }
             moves.sort_by_key(|&m| -Self::mvv_lva(b, m));
@@ -615,6 +602,27 @@ impl Searcher {
             }
         }
 
+        // probe 0161: razoring. The mirror side of the window — the node
+        // looks too bad and the depth is small. We do not prune blindly:
+        // ask quiescence and accept only its fail-low confirmation. The
+        // call goes to quiescence (not alpha_beta) on purpose — otherwise
+        // the two would recurse into each other.
+        if self.razor_enabled
+            && depth <= self.razor_depth
+            && !in_check
+            && beta - alpha == 1
+            && alpha.abs() < MATE_THRESHOLD
+        {
+            let eval = if b.stm == WHITE { evaluate(b) } else { -evaluate(b) };
+            if eval + self.razor_margin * depth < alpha {
+                let q = self.quiescence(b, alpha - 1, alpha, ply, 0);
+                if q < alpha {
+                    self.put_buf(ply as usize, moves);
+                    return q;
+                }
+            }
+        }
+
         if self.nullmove_enabled && depth >= 3 && !in_check && b.has_non_pawn_material() {
             let saved = b.make_null();
             self.rep_keys.push(b.key);
@@ -663,17 +671,6 @@ impl Searcher {
             move_count += 1;
             let m_ext = if sing_ext > 0 && Some(m) == tt_move { sing_ext } else { 0 };
             let is_cap = Self::is_capture(b, m);
-            // probe 0045 (env NERYBA_LMP): late quiet at a non-PV node — skip
-            // (continue, not break: captures later in the list are still tried)
-            if self.lmp_enabled
-                && beta - alpha == 1
-                && !in_check
-                && !is_cap
-                && m.promo == 0
-                && move_count as f64 >= self.lmp_base + self.lmp_mul * (depth * depth) as f64
-            {
-                continue;
-            }
             let undo = b.make(m);
             self.rep_keys.push(b.key);
             let gives_check = b.in_check();

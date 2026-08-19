@@ -64,7 +64,6 @@ fn main() {
             let mut total_nodes = 0u64;
             let mut total_sing = 0u64;
             let mut total_see_skips = 0u64;
-            let mut total_qchecks = 0u64;
             let t0 = Instant::now();
             for fen in BENCH_FENS {
                 let mut b = Board::from_fen(fen).expect("bench fen");
@@ -74,7 +73,6 @@ fn main() {
                 total_nodes += s.nodes;
                 total_sing += s.sing_count;
                 total_see_skips += s.see_skips;
-                total_qchecks += s.qchecks_added;
                 println!(
                     "d{d} best={} score={score} nodes={}",
                     mv.map(|m| m.uci()).unwrap_or_default(),
@@ -88,9 +86,6 @@ fn main() {
             }
             if total_see_skips > 0 {
                 println!("see skips: {total_see_skips}"); // probe 0061, positive control
-            }
-            if total_qchecks > 0 {
-                println!("qchecks added: {total_qchecks}"); // probe 0071
             }
         }
         "seebatch" => {

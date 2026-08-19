@@ -60,8 +60,8 @@ sums of individual verdicts are never quoted as strength claims.
   Syzygy-filtered labels (filtered offline via python-chess; the engine
   does no tablebase probing at runtime)
 - Search: iterative deepening alpha-beta, flat TT, quiescence + QTT
-  + SEE pruning, null-move pruning, LMR, RFP, persistent search state
-  with history aging, killers/history
+  + SEE pruning, null-move pruning, LMR, RFP, razoring, persistent
+  search state with history aging, killers/history
 - Time management: non-uniform budget with soft/hard bounds
 - Born: May 2026 (Python prototypes), Rust core: July 2026
 
@@ -71,13 +71,13 @@ Each published snapshot carries a version (`Cargo.toml`, echoed in
 `uci` → `id name`); tags `vX.Y.Z` mark them in this repository. MINOR
 bumps on every strength-changing deployment, PATCH on non-playing
 changes. Production weights are attached to the matching GitHub release.
-Current: **0.5.0** — the buckets+i16 stack.
+Current: **0.6.0** — the buckets+i16 stack plus razoring.
 
 ## Building
 
 ```
 cargo build --release
-./target/release/neryba bench 5
+./target/release/neryba bench 5     # 93065 nodes for this version
 ```
 
 The production NNUE weights (`src/nets/neryba0063.bin`, ~196K, trained
@@ -85,7 +85,12 @@ on the engine's own self-play data) are included — the repository builds
 out of the box. net-0063 (probe 0063, production since 2026-07-17) adds
 8 phase-conditioned output buckets on top of the net-2 flywheel weights
 (probe 0085, also included); it beats net-2 by +10.9 Elo in the SPRT
-deploy gate — a relative, internal number, not an external rating. An
+deploy gate — a relative, internal number, not an external rating.
+Version 0.6.0 adds razoring (probe 0161): +24.4 Elo [+6.95, +41.90] over
+0.5.0 over 1000 fixed games at the production time control 180+2, after
+a +61.1 screening at 8+0.08 — the gap between the two is the usual one,
+short time controls overstate an improvement. `NERYBA_RAZOR_OFF=1`
+restores the 0.5.0 search tree bit-for-bit. An
 external gauntlet of the *previous* stack (net-2, probe 0089) measured
 ≈2761 CCRL-anchored; the current stack has not been externally measured
 yet.
