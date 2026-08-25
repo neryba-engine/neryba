@@ -110,6 +110,12 @@ pub struct Searcher {
     pub razor_enabled: bool,
     pub razor_margin: i32,
     pub razor_depth: i32,
+    /// probe 0126 (metric) -> probe 0175 (strength): a capture with
+    /// `see(m) < 0` drops below the killers but stays above quiet moves.
+    /// Default-on since 0.7.0 — +23.0 Elo [+11.9, +34.1] at 180+2 over 2500
+    /// games. `NERYBA_SEE_ORD_OFF` is the ablation knob (same pattern as
+    /// RFP 0044, persist 0055, SEE-qs 0061, razoring 0161).
+    see_ord: bool,
     /// probe 0046 (env NERYBA_IIR): internal iterative reductions —
     /// depth−1 at nodes without a TT move. off = tree bit-for-bit unchanged.
     pub iir_enabled: bool,
@@ -205,6 +211,7 @@ impl Searcher {
             razor_enabled: std::env::var("NERYBA_RAZOR_OFF").is_err(),
             razor_margin: std::env::var("NERYBA_RAZOR_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(200),
             razor_depth: std::env::var("NERYBA_RAZOR_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            see_ord: std::env::var("NERYBA_SEE_ORD_OFF").is_err(),
             iir_enabled: std::env::var("NERYBA_IIR").is_ok(),
             iir_min: std::env::var("NERYBA_IIR_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
             // probe 0055 GREEN (+27.6 Elo SPRT accept @1844 — research/0055-
@@ -352,11 +359,21 @@ impl Searcher {
     fn order_moves(&self, b: &Board, moves: &mut [Move], tt_move: Option<Move>, ply: usize, prev: Option<usize>) {
         let k = if ply < 64 { self.killers[ply] } else { [None; 2] };
         let color = b.stm;
-        moves.sort_by_key(|&m| {
+        // probe 0126: sort_by_cached_key — sort_by_key does NOT cache the key
+        // and recomputes it on every comparison; with SEE inside that would
+        // cost log n times more. Both sorts are stable, so with equal keys the
+        // resulting order is identical (gated by bench when the flag is off).
+        moves.sort_by_cached_key(|&m| {
             let s = if Some(m) == tt_move {
                 1_000_000
             } else if Self::is_capture(b, m) || m.promo != 0 {
-                100_000 + Self::mvv_lva(b, m)
+                // probe 0126: a losing capture stops being the first candidate
+                // but stays above quiet moves (history is capped at 8192)
+                if self.see_ord && m.promo == 0 && Self::is_capture(b, m) && b.see(m) < 0 {
+                    20_000 + Self::mvv_lva(b, m)
+                } else {
+                    100_000 + Self::mvv_lva(b, m)
+                }
             } else if Some(m) == k[0] {
                 90_000
             } else if Some(m) == k[1] {

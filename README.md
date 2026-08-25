@@ -71,13 +71,14 @@ Each published snapshot carries a version (`Cargo.toml`, echoed in
 `uci` → `id name`); tags `vX.Y.Z` mark them in this repository. MINOR
 bumps on every strength-changing deployment, PATCH on non-playing
 changes. Production weights are attached to the matching GitHub release.
-Current: **0.6.0** — the buckets+i16 stack plus razoring.
+Current: **0.7.0** — the buckets+i16 stack plus razoring and
+SEE-based capture ordering.
 
 ## Building
 
 ```
 cargo build --release
-./target/release/neryba bench 5     # 93065 nodes for this version
+./target/release/neryba bench 5     # 82636 nodes for this version
 ```
 
 The production NNUE weights (`src/nets/neryba0063.bin`, ~196K, trained
@@ -90,7 +91,16 @@ Version 0.6.0 adds razoring (probe 0161): +24.4 Elo [+6.95, +41.90] over
 0.5.0 over 1000 fixed games at the production time control 180+2, after
 a +61.1 screening at 8+0.08 — the gap between the two is the usual one,
 short time controls overstate an improvement. `NERYBA_RAZOR_OFF=1`
-restores the 0.5.0 search tree bit-for-bit. An
+restores the 0.5.0 search tree bit-for-bit.
+
+Version 0.7.0 adds SEE-based capture ordering (probe 0126 for the metric,
+probe 0175 for the strength): a capture with `see(m) < 0` is scored
+`20_000 + mvv_lva` instead of `100_000 + mvv_lva`, so it drops below the
+killers but stays above quiet moves. The share of beta-cutoffs happening
+on the very first move goes from 83.5% to 91.3%, and the tree shrinks by
+24% at `bench 13`. Measured at +23.0 Elo [+11.9, +34.1] over 0.6.0 across
+2500 fixed games at 180+2, after a +20.8 screening at 8+0.08.
+`NERYBA_SEE_ORD_OFF=1` restores the 0.6.0 search tree bit-for-bit. An
 external gauntlet of the *previous* stack (net-2, probe 0089) measured
 ≈2761 CCRL-anchored; the current stack has not been externally measured
 yet.
