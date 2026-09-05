@@ -116,8 +116,31 @@ pub struct Searcher {
     /// games. `NERYBA_SEE_ORD_OFF` is the ablation knob (same pattern as
     /// RFP 0044, persist 0055, SEE-qs 0061, razoring 0161).
     see_ord: bool,
-    /// probe 0046 (env NERYBA_IIR): internal iterative reductions —
-    /// depth−1 at nodes without a TT move. off = tree bit-for-bit unchanged.
+    /// probe 0163 (env NERYBA_COUNTER_OFF) — default-on since 0.9.0 as part of
+    /// the 0191 package. Counter-move: ONE reply per previous move that caused
+    /// a beta cutoff, slotted between the killers and history. Not a duplicate
+    /// of conthist (probe 0043, GRAY): that keeps a continuous weight for every
+    /// prev x cur pair and adds it to history; this one grants priority.
+    pub counter_enabled: bool,
+    counter: Vec<Option<Move>>,
+    /// probe 0164 (env NERYBA_HP_OFF) — default-on since 0.9.0 as part of the
+    /// 0191 package. History pruning in the `history == 0` form: skip late
+    /// quiet moves that have never once produced a beta cutoff. Zero is chosen
+    /// deliberately — history here grows without saturation, survives across
+    /// moves (persist 0055) and is halved by aging (0057), so an absolute
+    /// threshold would mean different things on move 10 and move 60.
+    /// NOTE: this prunes at `depth <= 3`, which is exactly where the exact
+    /// search oracle measures, so it breaks exact-value parity by construction.
+    pub hp_enabled: bool,
+    pub hp_depth: i32,
+    pub hp_count: usize,
+    /// probe 0178 (env NERYBA_BADCAP_LAST_OFF) — default-on since 0.9.0 as part
+    /// of the 0191 package. A losing capture goes to the very end of the list
+    /// (the textbook scheme) instead of sitting between killers and quiets.
+    badcap_last: bool,
+    /// probe 0046 (env NERYBA_IIR_OFF) — default-on since 0.9.0 as part of the
+    /// 0191 package. Internal iterative reductions: depth−1 at nodes without a
+    /// TT move. The flag DISABLES it.
     pub iir_enabled: bool,
     pub iir_min: i32,
     /// probe 0055 (env NERYBA_PERSIST): TT+killers+history live across
@@ -212,7 +235,17 @@ impl Searcher {
             razor_margin: std::env::var("NERYBA_RAZOR_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(200),
             razor_depth: std::env::var("NERYBA_RAZOR_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
             see_ord: std::env::var("NERYBA_SEE_ORD_OFF").is_err(),
-            iir_enabled: std::env::var("NERYBA_IIR").is_ok(),
+            // probe 0191: six flags that were each GRAY on the fast screening
+            // control turned out to be worth +133.7 Elo together at the
+            // production time control — the short control is simply blind to
+            // depth-dependent features. Promoted default-on in 0.9.0.
+            counter_enabled: std::env::var("NERYBA_COUNTER_OFF").is_err(),
+            counter: vec![None; 768],
+            hp_enabled: std::env::var("NERYBA_HP_OFF").is_err(),
+            hp_depth: std::env::var("NERYBA_HP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            hp_count: std::env::var("NERYBA_HP_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
+            badcap_last: std::env::var("NERYBA_BADCAP_LAST_OFF").is_err(),
+            iir_enabled: std::env::var("NERYBA_IIR_OFF").is_err(),
             iir_min: std::env::var("NERYBA_IIR_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
             // probe 0055 GREEN (+27.6 Elo SPRT accept @1844 — research/0055-
             // persistent-state/VERDICT.md): persist default-on;
@@ -224,7 +257,7 @@ impl Searcher {
             hist_age: std::env::var("NERYBA_HIST_AGE_OFF").is_err(),
             hist2: std::env::var("NERYBA_HIST2").is_ok(),
             qcontempt: std::env::var("NERYBA_QCONTEMPT").is_ok(),
-            singular: std::env::var("NERYBA_SINGULAR").is_ok(),
+            singular: std::env::var("NERYBA_SINGULAR_OFF").is_err(),
             sing_min: std::env::var("NERYBA_SING_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(7),
             sing_margin: std::env::var("NERYBA_SING_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
             sing_count: 0,
@@ -308,6 +341,7 @@ impl Searcher {
         self.killers = [[None; 2]; 64];
         self.history.iter_mut().for_each(|h| *h = 0);
         self.conthist.iter_mut().for_each(|h| *h = 0);
+        self.counter.iter_mut().for_each(|c| *c = None);
     }
 
     #[inline]
@@ -363,6 +397,7 @@ impl Searcher {
         // and recomputes it on every comparison; with SEE inside that would
         // cost log n times more. Both sorts are stable, so with equal keys the
         // resulting order is identical (gated by bench when the flag is off).
+        let counter_mv = if self.counter_enabled { prev.and_then(|p| self.counter[p]) } else { None };
         moves.sort_by_cached_key(|&m| {
             let s = if Some(m) == tt_move {
                 1_000_000
@@ -370,7 +405,14 @@ impl Searcher {
                 // probe 0126: a losing capture stops being the first candidate
                 // but stays above quiet moves (history is capped at 8192)
                 if self.see_ord && m.promo == 0 && Self::is_capture(b, m) && b.see(m) < 0 {
-                    20_000 + Self::mvv_lva(b, m)
+                    // probe 0178: the textbook scheme puts a losing capture
+                    // AFTER the quiets. Our history is >= 0 (+= depth*depth),
+                    // so a negative key keeps it last no matter how history grows.
+                    if self.badcap_last {
+                        -1_000_000 + Self::mvv_lva(b, m)
+                    } else {
+                        20_000 + Self::mvv_lva(b, m)
+                    }
                 } else {
                     100_000 + Self::mvv_lva(b, m)
                 }
@@ -378,10 +420,19 @@ impl Searcher {
                 90_000
             } else if Some(m) == k[1] {
                 80_000
+            } else if counter_mv == Some(m) {
+                // probe 0163: below the killers (80k), above any history value
+                // (capped at 8192)
+                70_000
             } else {
                 let mut h = self.history[Self::hist_index(color, m)];
-                if let Some(p) = prev {
-                    h += self.conthist[p * 768 + ps_index(b.sq[m.from as usize], m.to)];
+                // probe 0163: prev now exists even with conthist off (the
+                // counter-move keys off it too), so the conthist access must be
+                // guarded — otherwise we index an empty vector.
+                if self.conthist_enabled || self.hist2 {
+                    if let Some(p) = prev {
+                        h += self.conthist[p * 768 + ps_index(b.sq[m.from as usize], m.to)];
+                    }
                 }
                 h
             };
@@ -691,8 +742,25 @@ impl Searcher {
             let undo = b.make(m);
             self.rep_keys.push(b.key);
             let gives_check = b.in_check();
+            // probe 0164: history pruning — a late quiet move that has never
+            // produced a cutoff. Checks and check evasions are never pruned
+            // (control 4, the lesson of probe 0162).
+            if self.hp_enabled
+                && depth <= self.hp_depth
+                && beta - alpha == 1
+                && !in_check
+                && !gives_check
+                && !is_cap
+                && m.promo == 0
+                && move_count >= self.hp_count
+                && self.history[Self::hist_index(b.stm, m)] == 0
+            {
+                self.rep_keys.pop();
+                b.unmake(m, undo);
+                continue;
+            }
             // 0043: piece-square of this move (after make — promotion accounted for)
-            let child_prev = if self.conthist_enabled || self.hist2 {
+            let child_prev = if self.conthist_enabled || self.hist2 || self.counter_enabled {
                 Some(ps_index(b.sq[m.to as usize], m.to))
             } else {
                 None
@@ -742,6 +810,12 @@ impl Searcher {
                             kl[0] = Some(m);
                         }
                     }
+                    // probe 0163: this quiet move refuted prev — remember it
+                    if self.counter_enabled {
+                        if let Some(p) = prev {
+                            self.counter[p] = Some(m);
+                        }
+                    }
                     if self.hist2 {
                         // probe 0049: gravity bonus for the winner + malus
                         // for this node's tried quiets (b already after unmake)
@@ -768,10 +842,14 @@ impl Searcher {
                         }
                     } else {
                         self.history[Self::hist_index(b.stm, m)] += depth * depth;
-                        // 0043: same formula for conthist (b already after unmake)
-                        if let Some(p) = prev {
-                            self.conthist[p * 768 + ps_index(b.sq[m.from as usize], m.to)] +=
-                                depth * depth;
+                        // 0043: same formula for conthist (b already after unmake).
+                        // probe 0163: the access is behind the flag — prev now
+                        // exists with conthist OFF too, and then the vector is empty
+                        if self.conthist_enabled || self.hist2 {
+                            if let Some(p) = prev {
+                                self.conthist[p * 768 + ps_index(b.sq[m.from as usize], m.to)] +=
+                                    depth * depth;
+                            }
                         }
                     }
                 }
@@ -823,7 +901,7 @@ impl Searcher {
             let undo = b.make(m);
             self.rep_keys.push(b.key);
             // 0043: the root move = prev for ply 1
-            let child_prev = if self.conthist_enabled || self.hist2 {
+            let child_prev = if self.conthist_enabled || self.hist2 || self.counter_enabled {
                 Some(ps_index(b.sq[m.to as usize], m.to))
             } else {
                 None

@@ -71,14 +71,14 @@ Each published snapshot carries a version (`Cargo.toml`, echoed in
 `uci` → `id name`); tags `vX.Y.Z` mark them in this repository. MINOR
 bumps on every strength-changing deployment, PATCH on non-playing
 changes. Production weights are attached to the matching GitHub release.
-Current: **0.8.0** — the buckets+i16 stack plus razoring,
-SEE-based capture ordering and the flywheel v3 net.
+Current: **0.9.0** — the buckets+i16 stack plus razoring, SEE-based
+capture ordering, the flywheel v3 net and the six-flag search package.
 
 ## Building
 
 ```
 cargo build --release
-./target/release/neryba bench 5     # 76254 nodes for this version
+./target/release/neryba bench 5     # 61578 nodes for this version
 ```
 
 The production NNUE weights (`src/nets/neryba0183.bin`, ~196K, trained
@@ -120,6 +120,52 @@ transfer of 61%. Second, that ratio is not a constant — across three
 measured points it falls as the effect grows (87% at +23 Elo, 61% at
 +88, 47% at +134), so an internal gate cannot be extrapolated to an
 external rating.
+
+Version 0.9.0 turns on six search features at once (probe 0191): internal
+iterative reductions (0046), singular extensions (0060), counter-moves
+(0163), history pruning (0164), losing captures ordered last (0178) and a
+transposition-table age guard (0111). Each of them had been measured alone
+on a fast screening control and each came back inconclusive — together
+they were worth +27.0 Elo by the sum of those point estimates. Measured as
+a package at the production time control they are worth **+133.7 Elo**
+[+122.0, +145.6] over 2500 fixed games, 4.9x the sum of the parts.
+
+The interesting part is not the number, it is why the parts looked small.
+At least two of the six cannot express themselves at a fast control at
+all: the age guard governs transposition-table replacement, and at 8+0.08
+the table never fills up, so replacement policy decides nothing; singular
+extensions fire at depth, and there is little depth to speak of. Those
+features were being judged by an instrument that physically could not
+measure what they do. Externally the package is worth +75.8 on top of the
+0.8.0 net, putting the engine at **≈2993 CCRL** [2971.2, 3016.5]
+(probe 0193). Each flag has its own `*_OFF` ablation knob, and all six
+together restore the 0.8.0 search tree bit-for-bit.
+
+### One difference between this snapshot and production
+
+**`NERYBA_TT_AGE_GUARD` is not part of this snapshot.** The guard refuses
+a transposition-table write when the slot already holds a deeper, equally
+recent entry for a different position — and that requires an age field in
+the slot. Production uses an atomic, aged flat table; the table published
+here is the simpler `FlatSlot { key, score, depth, flag, mv }` with no age
+at all, so the feature has nothing to key off. Porting it means porting a
+different table, which is a separate piece of work rather than a flag.
+
+The difference is measured, not estimated. This snapshot reproduces
+production bit-for-bit on every bench once the guard is disabled there:
+
+```
+                        bench 5   bench 8   bench 13
+this snapshot            61578    320526    9234230
+production, guard off    61578    320526    9234230
+production, guard on     61578    320482   10633799
+```
+
+Note the shape of it: the guard costs 44 nodes at `bench 8` and 1.4M at
+`bench 13`. That gap is the same phenomenon described above — whether the
+table fills up — and it is why the feature looked worthless on a fast
+control. The five features that are present here account for the rest of
+the package.
 
 ## License
 
