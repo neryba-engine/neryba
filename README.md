@@ -71,17 +71,17 @@ Each published snapshot carries a version (`Cargo.toml`, echoed in
 `uci` → `id name`); tags `vX.Y.Z` mark them in this repository. MINOR
 bumps on every strength-changing deployment, PATCH on non-playing
 changes. Production weights are attached to the matching GitHub release.
-Current: **0.7.0** — the buckets+i16 stack plus razoring and
-SEE-based capture ordering.
+Current: **0.8.0** — the buckets+i16 stack plus razoring,
+SEE-based capture ordering and the flywheel v3 net.
 
 ## Building
 
 ```
 cargo build --release
-./target/release/neryba bench 5     # 82636 nodes for this version
+./target/release/neryba bench 5     # 76254 nodes for this version
 ```
 
-The production NNUE weights (`src/nets/neryba0063.bin`, ~196K, trained
+The production NNUE weights (`src/nets/neryba0183.bin`, ~196K, trained
 on the engine's own self-play data) are included — the repository builds
 out of the box. net-0063 (probe 0063, production since 2026-07-17) adds
 8 phase-conditioned output buckets on top of the net-2 flywheel weights
@@ -100,10 +100,26 @@ killers but stays above quiet moves. The share of beta-cutoffs happening
 on the very first move goes from 83.5% to 91.3%, and the tree shrinks by
 24% at `bench 13`. Measured at +23.0 Elo [+11.9, +34.1] over 0.6.0 across
 2500 fixed games at 180+2, after a +20.8 screening at 8+0.08.
-`NERYBA_SEE_ORD_OFF=1` restores the 0.6.0 search tree bit-for-bit. An
-external gauntlet of the *previous* stack (net-2, probe 0089) measured
-≈2761 CCRL-anchored; the current stack has not been externally measured
-yet.
+`NERYBA_SEE_ORD_OFF=1` restores the 0.6.0 search tree bit-for-bit.
+
+Version 0.8.0 replaces the net (probe 0183). The architecture does not
+change at all — still HIDDEN=128 with 8 output buckets — and neither does
+the training volume, mix, node budget or filter. The only difference is
+who generated the corpus: the 0.7.0 engine itself, rather than the older
+stack the previous net had learned from. That single change is worth
++88.3 Elo [+76.6, +100.2] over 0.7.0 across 2500 fixed games at 180+2.
+The cargo feature `nnue_0063` builds the previous net instead and
+restores the 0.7.0 bench (82636 nodes).
+
+An external gauntlet against four Stash anchors (probe 0193, 4x400 games
+at 10+0.1) puts 0.8.0 at **≈2917 CCRL** [2896.9, 2938.7], measured
++54.1 above the 0.7.0 control run in the same session. Two things are
+worth stating plainly. First, the internal number and the external one
+are not the same quantity: +88.3 internally became +54.1 externally, a
+transfer of 61%. Second, that ratio is not a constant — across three
+measured points it falls as the effect grows (87% at +23 Elo, 61% at
++88, 47% at +134), so an internal gate cannot be extrapolated to an
+external rating.
 
 ## License
 

@@ -1,6 +1,6 @@
 [package]
 name = "neryba"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 # Zero dependencies, zero borrowed code — the not-a-clone principle.
@@ -14,6 +14,9 @@ codegen-units = 1
 [features]
 nnue_h512 = []
 nnue_h1024 = []
+# probe 0183 -- flywheel v3 net: PROMOTED to default in 0.8.0.
+# `nnue_0063` builds the previous production net instead (rollback / A-B).
+nnue_0063 = []
 # probe 0063 — output buckets: PROMOTED to default 2026-07-17 (feature removed).
 # probe 0090 — king input buckets (prong B): output buckets + 10 king buckets.
 nnue_kbuckets = []
