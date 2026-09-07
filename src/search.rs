@@ -440,6 +440,17 @@ impl Searcher {
         });
     }
 
+    /// probe 0212: emptiness of the FULL legal list in quiescence out of check.
+    /// With a full list — its emptiness; with a captures list — captures exist =>
+    /// a move exists, otherwise the has_legal_move_fast early exit (oracle test in board.rs).
+    #[inline]
+    fn q_full_empty(&mut self, b: &mut Board, moves: &[Move], caps_only: bool) -> bool {
+        if !caps_only || !moves.is_empty() {
+            return moves.is_empty() && !caps_only;
+        }
+        !b.has_legal_move_fast()
+    }
+
     fn is_repetition2(&self, key: u64) -> bool {
         self.rep_keys.iter().filter(|&&k| k == key).count() >= 2
     }
@@ -479,9 +490,21 @@ impl Searcher {
         }
 
         let mut moves = self.take_buf(ply as usize);
-        b.gen_legal_into(&mut moves); // one generation serves mate/stalemate/captures
-        if b.in_check() {
+        // probe 0212 arm 1: out of check generate ONLY captures, in the same order as
+        // gen_legal_into + retain(is_capture); emptiness of the FULL list (stalemate) is
+        // reproduced via has_legal_move_fast only when there are no captures. In check —
+        // the old path (all evasions).
+        // probe 0212 arm 2: in_check comes from the same generation (one checkers_pins).
+        let in_check_q = b.gen_q_into(&mut moves, true);
+        let caps_only = !in_check_q;
+        if in_check_q {
             if moves.is_empty() {
+                // probe 0206: before arm A, alpha_beta(depth 0) returned mate itself
+                // without entering quiescence — that leaf counted as ONE node. Keep the
+                // historical accounting (bit-identical bench invariant).
+                if qply == 0 {
+                    self.nodes -= 1;
+                }
                 self.put_buf(ply as usize, moves);
                 return -(MATE - ply);
             }
@@ -494,10 +517,16 @@ impl Searcher {
                 0
             };
             if b.is_insufficient_material() {
+                if qply == 0 && self.q_full_empty(b, &moves, caps_only) {
+                    self.nodes -= 1; // probe 0206: stalemate with insufficient material — one node too
+                }
                 self.put_buf(ply as usize, moves);
                 return draw_leaf;
             }
-            if moves.is_empty() {
+            if self.q_full_empty(b, &moves, caps_only) {
+                if qply == 0 {
+                    self.nodes -= 1; // probe 0206: see the comment in the in-check branch
+                }
                 self.put_buf(ply as usize, moves);
                 return draw_leaf; // stalemate leaf
             }
@@ -510,13 +539,13 @@ impl Searcher {
             if stand_pat > alpha {
                 alpha = stand_pat;
             }
-            {
+            if !caps_only {
                 moves.retain(|&m| Self::is_capture(b, m));
-            }
+            } // probe 0212: with caps_only the list already holds captures only
             moves.sort_by_key(|&m| -Self::mvv_lva(b, m));
         }
         let mut result = None;
-        let evasion = b.in_check();
+        let evasion = in_check_q; // probe 0212 arm 2: from generation
         for &m in moves.iter() {
             // probe 0061: a losing capture at a quiet node — skip (PREREG)
             if self.see_qs && !evasion && Self::is_capture(b, m) && b.see(m) < 0 {
@@ -641,19 +670,22 @@ impl Searcher {
         // only an upper bound, not EXACT.
         let alpha_orig = alpha;
 
-        let mut moves = self.take_buf(ply as usize);
-        b.gen_legal_into(&mut moves);
-        if moves.is_empty() {
-            self.put_buf(ply as usize, moves);
-            return if b.in_check() { -(MATE - ply) } else { 0 };
-        }
+        // probe 0206 arm A: depth==0 -> quiescence BEFORE generating the list. Previously
+        // the list was generated, discarded, and quiescence generated it again.
+        // Equivalence: quiescence itself returns -(MATE-ply) in check with no moves and
+        // 0 on stalemate — the same as the is_empty branch below. Gate: bench bit-identical.
         if depth == 0 {
-            // return the buffer BEFORE quiescence re-borrows the same ply slot
-            self.put_buf(ply as usize, moves);
             return self.quiescence(b, alpha, beta, ply, 0);
         }
 
-        let in_check = b.in_check();
+        let mut moves = self.take_buf(ply as usize);
+        // probe 0212 arm 2: in_check from generation (the same checkers_pins), no second attacked
+        let in_check = b.gen_legal_into(&mut moves);
+        if moves.is_empty() {
+            self.put_buf(ply as usize, moves);
+            return if in_check { -(MATE - ply) } else { 0 };
+        }
+
         // probe 0044 (env NERYBA_RFP): reverse futility — non-PV, not in check,
         // shallow: static eval exceeds beta by margin·depth → leaf without search.
         // Conditions and constants fixed in PREREG 0044 before the run.

@@ -189,9 +189,15 @@ pub struct Undo {
     ep: Option<u8>,
     halfmove: u16,
     key: u64,
-    /// probe 0032: accumulator snapshot before make (unmake restores it)
-    acc: crate::nnue::Acc,
+    // probe 0207: the 512-byte accumulator snapshot is gone from here — accumulators
+    // live in a per-ply stack (Board::acc_stack); unmake just moves the index.
 }
+// probe 0207, control 3: the copy is gone — Undo must stay small.
+const _: () = assert!(std::mem::size_of::<Undo>() <= 32);
+
+/// probe 0207: accumulator stack depth (margin over killers[64] and any search ply).
+/// Overflow panics on indexing: better to crash than to silently corrupt the eval.
+pub const ACC_STACK: usize = 128;
 
 #[derive(Clone)]
 pub struct Board {
@@ -210,9 +216,11 @@ pub struct Board {
     pub pieces: [u64; 7],
     /// king squares [white, black] (probe 0090: the king input bucket reads them in nnue).
     pub king: [u8; 2],
-    /// probe 0032: color-indexed NNUE accumulators (White-persp, Black-persp),
-    /// maintained in make/unmake (delta update in make, snapshot rollback in unmake)
-    pub acc: crate::nnue::Acc,
+    /// probe 0032/0207: color-indexed NNUE accumulators (White-persp, Black-persp)
+    /// in a per-ply stack: make writes slot acc_ply+1 from the parent slot + deltas,
+    /// unmake only decrements acc_ply. Current accumulator: `acc()`.
+    pub acc_stack: Box<[crate::nnue::Acc; ACC_STACK]>,
+    pub acc_ply: usize,
 }
 
 pub const KNIGHT_ATT_PUB: &[u64; 64] = &KNIGHT_ATT;
@@ -221,6 +229,12 @@ pub const KING_ATT_PUB: &[u64; 64] = &KING_ATT;
 impl Board {
     pub fn startpos() -> Board {
         Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap()
+    }
+
+    /// probe 0207: current accumulator = stack slot `acc_ply`.
+    #[inline]
+    pub fn acc(&self) -> &crate::nnue::Acc {
+        &self.acc_stack[self.acc_ply]
     }
 
     pub fn from_fen(fen: &str) -> Result<Board, String> {
@@ -239,7 +253,8 @@ impl Board {
             occ: [0, 0],
             pieces: [0; 7],
             king: [64, 64],
-            acc: [[0i16; crate::nnue::HIDDEN]; 2], // probe 0093: i16 layout
+            acc_stack: Box::new([[[0i16; crate::nnue::HIDDEN]; 2]; ACC_STACK]), // probe 0093: i16 layout; 0207: stack
+            acc_ply: 0,
         };
         let mut r: i8 = 7;
         let mut f: i8 = 0;
@@ -296,7 +311,8 @@ impl Board {
         b.key = b.compute_key();
         b.occ = b.compute_occ();
         b.pieces = b.compute_pieces();
-        b.acc = crate::nnue::refresh(&b.sq, b.occ[0] | b.occ[1], b.king); // probe 0032
+        b.acc_stack[0] = crate::nnue::refresh(&b.sq, b.occ[0] | b.occ[1], b.king); // probe 0032/0207: slot 0
+        b.acc_ply = 0;
         Ok(b)
     }
 
@@ -854,8 +870,12 @@ impl Board {
             ep: self.ep,
             halfmove: self.halfmove,
             key: self.key,
-            acc: self.acc, // probe 0032: snapshot BEFORE changes; unmake restores it
         };
+        // probe 0207: child slot = parent + the deltas below (same wrapping ops in the
+        // same order as before on the copy -> byte-identical accumulator).
+        // Fused pass: slot p1 is written from the parent together with the first delta
+        // (sub_piece_into below, after the board update); the remaining deltas are in-place.
+        let p1 = self.acc_ply + 1;
         // capture (en passant takes the pawn behind the target square)
         if ptype(p) == PAWN && Some(m.to) == self.ep && self.sq[m.to as usize] == EMPTY
             && file_of(m.from) != file_of(m.to)
@@ -867,15 +887,23 @@ impl Board {
             k ^= piece_key(pcolor(undo.cap), ptype(undo.cap), undo.cap_sq);
             self.occ[pcolor(undo.cap) as usize] &= !(1u64 << undo.cap_sq);
             self.pieces[ptype(undo.cap) as usize] &= !(1u64 << undo.cap_sq);
-            crate::nnue::sub_piece(&mut self.acc, pcolor(undo.cap), ptype(undo.cap) - 1, undo.cap_sq, self.king);
+            // 0207: the capture delta is applied below, AFTER the fused pass
         }
         self.sq[undo.cap_sq as usize] = EMPTY;
 
         let placed = if m.promo != 0 { make_piece(us, m.promo) } else { p };
         k ^= piece_key(us, ptype(p), m.from);
         k ^= piece_key(us, ptype(placed), m.to);
-        crate::nnue::sub_piece(&mut self.acc, us, ptype(p) - 1, m.from, self.king);
-        crate::nnue::add_piece(&mut self.acc, us, ptype(placed) - 1, m.to, self.king);
+        {
+            // probe 0207: dst = src - row(from) in a single pass; then in-place.
+            let (lo, hi) = self.acc_stack.split_at_mut(p1);
+            crate::nnue::sub_piece_into(&lo[p1 - 1], &mut hi[0], us, ptype(p) - 1, m.from, self.king);
+        }
+        self.acc_ply = p1;
+        if undo.cap != EMPTY {
+            crate::nnue::sub_piece(&mut self.acc_stack[p1], pcolor(undo.cap), ptype(undo.cap) - 1, undo.cap_sq, self.king);
+        }
+        crate::nnue::add_piece(&mut self.acc_stack[p1], us, ptype(placed) - 1, m.to, self.king);
         self.sq[m.from as usize] = EMPTY;
         self.sq[m.to as usize] = placed;
         self.occ[us as usize] =
@@ -895,8 +923,8 @@ impl Board {
                     (self.occ[us as usize] & !(1u64 << (m.to + 1))) | (1u64 << (m.to - 1));
                 self.pieces[ROOK as usize] =
                     (self.pieces[ROOK as usize] & !(1u64 << (m.to + 1))) | (1u64 << (m.to - 1));
-                crate::nnue::sub_piece(&mut self.acc, us, ROOK - 1, m.to + 1, self.king);
-                crate::nnue::add_piece(&mut self.acc, us, ROOK - 1, m.to - 1, self.king);
+                crate::nnue::sub_piece(&mut self.acc_stack[p1], us, ROOK - 1, m.to + 1, self.king);
+                crate::nnue::add_piece(&mut self.acc_stack[p1], us, ROOK - 1, m.to - 1, self.king);
             } else if d == -2 {
                 // O-O-O: rook a->d
                 self.sq[(m.to - 2) as usize] = EMPTY;
@@ -906,8 +934,8 @@ impl Board {
                     (self.occ[us as usize] & !(1u64 << (m.to - 2))) | (1u64 << (m.to + 1));
                 self.pieces[ROOK as usize] =
                     (self.pieces[ROOK as usize] & !(1u64 << (m.to - 2))) | (1u64 << (m.to + 1));
-                crate::nnue::sub_piece(&mut self.acc, us, ROOK - 1, m.to - 2, self.king);
-                crate::nnue::add_piece(&mut self.acc, us, ROOK - 1, m.to + 1, self.king);
+                crate::nnue::sub_piece(&mut self.acc_stack[p1], us, ROOK - 1, m.to - 2, self.king);
+                crate::nnue::add_piece(&mut self.acc_stack[p1], us, ROOK - 1, m.to + 1, self.king);
             }
             // probe 0090 (Option 1): a king move changes bucket/mirror -> full refresh
             // of both perspectives (the incremental deltas above get overwritten).
@@ -915,7 +943,7 @@ impl Board {
             // (just an extra recompute on a king move; only nnue_kbuckets enables it).
             #[cfg(feature = "nnue_kbuckets")]
             {
-                self.acc = crate::nnue::refresh(&self.sq, self.occ[0] | self.occ[1], self.king);
+                self.acc_stack[p1] = crate::nnue::refresh(&self.sq, self.occ[0] | self.occ[1], self.king);
             }
         }
 
@@ -948,7 +976,7 @@ impl Board {
         debug_assert_eq!(self.pieces, self.compute_pieces());
         // probe 0032 oracle: incremental accumulator == fresh recompute
         // (probe 0090: now also validates the king input bucket — refresh takes self.king)
-        debug_assert_eq!(self.acc, crate::nnue::refresh(&self.sq, self.occ[0] | self.occ[1], self.king));
+        debug_assert_eq!(self.acc_stack[p1], crate::nnue::refresh(&self.sq, self.occ[0] | self.occ[1], self.king));
         undo
     }
 
@@ -990,7 +1018,7 @@ impl Board {
         self.ep = undo.ep;
         self.halfmove = undo.halfmove;
         self.key = undo.key;
-        self.acc = undo.acc; // probe 0032: snapshot rollback (zero drift)
+        self.acc_ply -= 1; // probe 0207: rollback = index decrement; the parent slot was never touched (zero drift)
         if us == BLACK {
             self.fullmove -= 1;
         }
@@ -999,18 +1027,9 @@ impl Board {
 
     /// Any legal move at all? Early-exit version for stalemate checks.
     pub fn has_legal_move(&mut self) -> bool {
-        let mut ps = Vec::with_capacity(64);
-        self.gen_pseudo(&mut ps);
-        for m in ps {
-            let undo = self.make(m);
-            let mover = 1 - self.stm;
-            let ok = !self.attacked(self.king[mover as usize], self.stm);
-            self.unmake(m, undo);
-            if ok {
-                return true;
-            }
-        }
-        false
+        // probe 0212: the old implementation (full gen_pseudo + make/unmake up to the first
+        // legal move) is replaced by the fast equivalent; equivalence — oracle test.
+        self.has_legal_move_fast()
     }
 
     /// Null move (pass): flip side to move, clear ep. For null-move pruning.
@@ -1167,10 +1186,23 @@ impl Board {
     /// generation order (order changes would reshuffle stable-sort ties in
     /// the search and shift node counts — the PREREG invariant forbids that).
     /// Cheap path: checkers/pins masks (arm A); king/ep: make/unmake.
-    pub fn gen_legal_into(&mut self, out: &mut Vec<Move>) {
+    /// probe 0212 arm 2: returns `in_check` (from `checkers_pins`, which the filter
+    /// computes anyway) — so a node does not pay for a second `attacked(king)`.
+    pub fn gen_legal_into(&mut self, out: &mut Vec<Move>) -> bool {
         out.clear();
+        let cp = self.checkers_pins();
         self.gen_pseudo(out);
-        let (_n_chk, allowed, pins, n_pins) = self.checkers_pins();
+        self.filter_legal_with(out, &cp);
+        debug_assert_eq!(*out, self.gen_legal_ref(), "fast legality diverged: {}", self.fen());
+        debug_assert_eq!(cp.0 > 0, self.in_check());
+        cp.0 > 0
+    }
+
+    /// probe 0212: legality filter shared by gen_legal_into / gen_captures_into /
+    /// gen_q_into (lifted verbatim out of gen_legal_into — one code, one semantics);
+    /// `cp` — the `checkers_pins` result, computed once per node.
+    fn filter_legal_with(&mut self, out: &mut Vec<Move>, cp: &(u32, u64, [(u8, u64); 8], usize)) {
+        let (allowed, pins, n_pins) = (cp.1, &cp.2, cp.3);
         let ksq = self.king[self.stm as usize];
         let mut w = 0usize;
         for i in 0..out.len() {
@@ -1206,7 +1238,191 @@ impl Board {
             }
         }
         out.truncate(w);
-        debug_assert_eq!(*out, self.gen_legal_ref(), "fast legality diverged: {}", self.fen());
+    }
+
+    /// probe 0212 arm 1: captures only (`is_capture`: occupied target or ep capture;
+    /// non-capturing promotions are NOT captures) in THE SAME relative order they
+    /// have in the gen_legal_into output: pieces by ascending square, the same
+    /// direction/target order as gen_pseudo, the same legality filter.
+    /// Oracle — test `captures_gen_matches_legal_retain_0212`.
+    fn emit_captures(&self, out: &mut Vec<Move>) {
+        out.clear();
+        let us = self.stm;
+        let them = 1 - us;
+        let occ_all = self.occ[0] | self.occ[1];
+        let enemy = self.occ[them as usize];
+        let fwd: i8 = if us == WHITE { 8 } else { -8 };
+        let mut own = self.occ[us as usize];
+        while own != 0 {
+            let s = own.trailing_zeros() as u8;
+            own &= own - 1;
+            let p = self.sq[s as usize];
+            match ptype(p) {
+                PAWN => {
+                    let f = file_of(s);
+                    for df in [-1i8, 1] {
+                        let nf = f + df;
+                        if !(0..8).contains(&nf) {
+                            continue;
+                        }
+                        let t = (s as i8 + fwd + df) as u8;
+                        if enemy & (1u64 << t) != 0 {
+                            self.push_pawn_moves(s, t, out);
+                        } else if Some(t) == self.ep {
+                            out.push(Move { from: s, to: t, promo: 0 });
+                        }
+                    }
+                }
+                KNIGHT | KING => {
+                    let table = if ptype(p) == KNIGHT { &KNIGHT_ATT } else { &KING_ATT };
+                    let mut m = table[s as usize] & enemy;
+                    while m != 0 {
+                        let t = m.trailing_zeros() as u8;
+                        m &= m - 1;
+                        out.push(Move { from: s, to: t, promo: 0 });
+                    }
+                }
+                pt => {
+                    let dir_range = match pt {
+                        BISHOP => 0..4usize,
+                        ROOK => 4..8,
+                        _ => 0..8,
+                    };
+                    for d in dir_range {
+                        let blockers = RAYS[d][s as usize] & occ_all;
+                        if blockers == 0 {
+                            continue;
+                        }
+                        let fb = if POSITIVE_DIR[d] {
+                            blockers.trailing_zeros() as usize
+                        } else {
+                            63 - blockers.leading_zeros() as usize
+                        };
+                        if enemy & (1u64 << fb) != 0 {
+                            out.push(Move { from: s, to: fb as u8, promo: 0 });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// probe 0212 arm 1: legal captures (order as gen_legal_into + retain); returns `in_check`.
+    pub fn gen_captures_into(&mut self, out: &mut Vec<Move>) -> bool {
+        let cp = self.checkers_pins();
+        self.emit_captures(out);
+        self.filter_legal_with(out, &cp);
+        cp.0 > 0
+    }
+
+    /// probe 0212 arm 2: quiescence generation with ONE `checkers_pins` per node:
+    /// in check — the full list (evasions); out of check with `prefer_captures` —
+    /// captures only. Returns `in_check`.
+    pub fn gen_q_into(&mut self, out: &mut Vec<Move>, prefer_captures: bool) -> bool {
+        let cp = self.checkers_pins();
+        let in_check = cp.0 > 0;
+        if in_check || !prefer_captures {
+            out.clear();
+            self.gen_pseudo(out);
+        } else {
+            self.emit_captures(out);
+        }
+        self.filter_legal_with(out, &cp);
+        in_check
+    }
+
+    /// probe 0212 arm 1: does at least one legal move exist — early exit, no list.
+    /// Non-king non-ep moves via checkers/pins masks (as the filter), king and ep via
+    /// make/unmake (as the filter). Castling is not checked: a legal castling implies
+    /// a legal king step to f/d (same conditions). Equivalence with
+    /// `!gen_legal().is_empty()` — oracle test.
+    pub fn has_legal_move_fast(&mut self) -> bool {
+        let us = self.stm;
+        let them = 1 - us;
+        let occ_all = self.occ[0] | self.occ[1];
+        let own_occ = self.occ[us as usize];
+        let enemy = self.occ[them as usize];
+        let fwd: i8 = if us == WHITE { 8 } else { -8 };
+        let start_rank: i8 = if us == WHITE { 1 } else { 6 };
+        let (_n_chk, allowed, pins, n_pins) = self.checkers_pins();
+        let ksq = self.king[us as usize];
+        let mut own = own_occ & !(1u64 << ksq);
+        while own != 0 {
+            let s = own.trailing_zeros() as u8;
+            own &= own - 1;
+            let p = self.sq[s as usize];
+            let targets = match ptype(p) {
+                PAWN => {
+                    let mut t = 0u64;
+                    let one = (s as i8 + fwd) as u8;
+                    if occ_all & (1u64 << one) == 0 {
+                        t |= 1u64 << one;
+                        if rank_of(s) == start_rank {
+                            let two = (one as i8 + fwd) as u8;
+                            if occ_all & (1u64 << two) == 0 {
+                                t |= 1u64 << two;
+                            }
+                        }
+                    }
+                    let f = file_of(s);
+                    for df in [-1i8, 1] {
+                        let nf = f + df;
+                        if (0..8).contains(&nf) {
+                            let c = (s as i8 + fwd + df) as u8;
+                            if enemy & (1u64 << c) != 0 {
+                                t |= 1u64 << c; // ep — separately below (make/unmake)
+                            }
+                        }
+                    }
+                    t
+                }
+                KNIGHT => KNIGHT_ATT[s as usize] & !own_occ,
+                BISHOP => slider_attacks(s, occ_all, true) & !own_occ,
+                ROOK => slider_attacks(s, occ_all, false) & !own_occ,
+                _ => (slider_attacks(s, occ_all, true) | slider_attacks(s, occ_all, false)) & !own_occ,
+            };
+            let mut mask = allowed;
+            for &(pf, pmask) in &pins[..n_pins] {
+                if pf == s {
+                    mask &= pmask;
+                    break;
+                }
+            }
+            if targets & mask != 0 {
+                return true;
+            }
+        }
+        let mut km = KING_ATT[ksq as usize] & !own_occ;
+        while km != 0 {
+            let t = km.trailing_zeros() as u8;
+            km &= km - 1;
+            let m = Move { from: ksq, to: t, promo: 0 };
+            let undo = self.make(m);
+            let ok = !self.attacked(self.king[us as usize], them);
+            self.unmake(m, undo);
+            if ok {
+                return true;
+            }
+        }
+        if let Some(e) = self.ep {
+            for df in [-1i8, 1] {
+                let nf = file_of(e) + df;
+                if !(0..8).contains(&nf) {
+                    continue;
+                }
+                let from = (e as i8 - fwd + df) as u8;
+                if self.sq[from as usize] == make_piece(us, PAWN) {
+                    let m = Move { from, to: e, promo: 0 };
+                    let undo = self.make(m);
+                    let ok = !self.attacked(self.king[us as usize], them);
+                    self.unmake(m, undo);
+                    if ok {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     // NOTE(0009-B): in gen_legal_into, king/ep moves are appended AFTER the
@@ -1235,6 +1451,112 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// probe 0212, control 2 (blocking): gen_captures_into == gen_legal_into + retain(is_capture)
+    /// as a list WITH ORDER, and has_legal_move_fast == !gen_legal.is_empty(). Positions: the
+    /// perft set, edge FENs (stalemate, mate, ep, castling, pins, capture-promotion) and random
+    /// lines from them (30 plies).
+    #[test]
+    fn captures_gen_matches_legal_retain_0212() {
+        fn is_cap(b: &Board, m: Move) -> bool {
+            b.sq[m.to as usize] != EMPTY
+                || (ptype(b.sq[m.from as usize]) == PAWN && Some(m.to) == b.ep && file_of(m.from) != file_of(m.to))
+        }
+        let mut fens: Vec<String> = vec![
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1",           // stalemate
+            "7k/6Q1/6K1/8/8/8/8/8 b - - 0 1",           // mate
+            "8/8/8/8/k2pP3/8/8/4K2R b K e3 0 1",        // ep available
+            "8/8/8/2k5/2pP4/8/B7/4K3 b - d3 0 3",       // ep while in check on the diagonal
+            "4k3/8/8/8/8/8/8/4K2R w K - 0 1",           // castling
+            "r3k3/8/8/8/8/8/8/4K3 b q - 0 1",
+            "k7/8/8/8/8/8/8/K6Q w - - 0 1",             // king/queen only
+            "8/8/8/8/8/1k6/8/K7 w - - 0 1",
+            "4k3/8/8/3q4/8/8/8/3BK3 w - - 0 1",         // pinned bishop
+            "4k3/8/8/8/8/8/2p5/1K6 b - - 0 1",           // capture-promotion possible next
+            "1k6/1P6/8/8/8/8/8/1K6 w - - 0 1",           // non-capturing promotions (not captures)
+            "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3", // white is mated
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        // random lines from the seed positions
+        let mut rng: u64 = 0x0212_2026_09_07;
+        let seeds = fens.clone();
+        for fen in &seeds {
+            let mut b = match Board::from_fen(fen) { Ok(b) => b, Err(_) => continue };
+            for _ in 0..30 {
+                let ms = b.gen_legal();
+                if ms.is_empty() { break; }
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                let m = ms[(rng % ms.len() as u64) as usize];
+                let _ = b.make(m);
+                fens.push(b.fen());
+            }
+        }
+        let mut n = 0usize;
+        for fen in &fens {
+            let mut b = match Board::from_fen(fen) { Ok(b) => b, Err(_) => continue };
+            if b.king[0] > 63 || b.king[1] > 63 { continue; }
+            let legal = b.gen_legal();
+            let expect: Vec<Move> = legal.iter().copied().filter(|&m| is_cap(&b, m)).collect();
+            let mut got = Vec::with_capacity(16);
+            b.gen_captures_into(&mut got);
+            assert_eq!(got, expect, "gen_captures_into diverged from gen_legal+retain: {fen}");
+            assert_eq!(b.has_legal_move_fast(), !legal.is_empty(), "has_legal_move_fast diverged: {fen}");
+            // arm 2: gen_q_into = (full list in check, captures otherwise) and returns in_check
+            let ic = b.in_check();
+            let mut q = Vec::with_capacity(64);
+            let ic_q = b.gen_q_into(&mut q, true);
+            assert_eq!(ic_q, ic, "gen_q_into: in_check diverged: {fen}");
+            assert_eq!(q, if ic { legal.clone() } else { expect.clone() }, "gen_q_into: list diverged: {fen}");
+            let mut full = Vec::with_capacity(64);
+            assert_eq!(b.gen_legal_into(&mut full), ic, "gen_legal_into: in_check diverged: {fen}");
+            n += 1;
+        }
+        eprintln!("0212 oracle: {n} positions OK");
+        assert!(n >= 300, "too few positions for the oracle: {n}");
+    }
+
+    /// probe 0207, control 2: the accumulator stack equals a full recompute after every
+    /// make (debug make also asserts it), and after a full unmake acc_ply is 0 and slot 0
+    /// is byte-identical.
+    #[test]
+    fn acc_stack_returns_to_root_0207() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ];
+        for fen in fens {
+            let mut b = Board::from_fen(fen).unwrap();
+            let root = b.acc_stack[0];
+            let mut undos = Vec::new();
+            let mut line = Vec::new();
+            for step in 0..40usize {
+                let ms = b.gen_legal();
+                if ms.is_empty() {
+                    break;
+                }
+                let m = ms[(step * 7 + 3) % ms.len()];
+                undos.push(b.make(m));
+                line.push(m);
+                assert_eq!(b.acc_ply, undos.len());
+                assert_eq!(*b.acc(), crate::nnue::refresh(&b.sq, b.occ[0] | b.occ[1], b.king));
+            }
+            while let Some(m) = line.pop() {
+                let u = undos.pop().unwrap();
+                b.unmake(m, u);
+            }
+            assert_eq!(b.acc_ply, 0);
+            assert_eq!(b.acc_stack[0], root);
+        }
+    }
 
     // Public perft vectors (CPW "Perft Results") — test data, not engine code.
     #[test]

@@ -131,15 +131,26 @@ a package at the production time control they are worth **+133.7 Elo**
 [+122.0, +145.6] over 2500 fixed games, 4.9x the sum of the parts.
 
 The interesting part is not the number, it is why the parts looked small.
-At least two of the six cannot express themselves at a fast control at
-all: the age guard governs transposition-table replacement, and at 8+0.08
-the table never fills up, so replacement policy decides nothing; singular
-extensions fire at depth, and there is little depth to speak of. Those
-features were being judged by an instrument that physically could not
-measure what they do. Externally the package is worth +75.8 on top of the
-0.8.0 net, putting the engine at **≈2993 CCRL** [2971.2, 3016.5]
-(probe 0193). Each flag has its own `*_OFF` ablation knob, and all six
-together restore the 0.8.0 search tree bit-for-bit.
+Five of the six have only ever been measured alone on the fast control, so
+for them the hypothesis is live: an 8+0.08 game is short enough that
+depth-dependent machinery barely fires, and the instrument cannot see what
+it cannot provoke. Singular extensions are the clearest candidate — they
+trigger at depth, and there is little depth to speak of.
+
+The sixth is a counter-example worth stating, because it was our own
+mistaken explanation first. The transposition-table age guard *was*
+measured alone at the production control (probe 0180): −2 Elo [−15, +12]
+over 1680 games, with a control confirming the guard was active (it cut
+14.1% of nodes at `bench 13`). So "the fast control could not see it" is
+simply false for that one — at the control where it demonstrably works, it
+buys nothing on its own. What the package is worth is measured; how that
+value is distributed among the six is **not** — probe 0191 measured the
+bundle as a bundle and never decomposed it.
+
+Externally the package is worth +75.8 on top of the 0.8.0 net, putting the
+engine at **≈2993 CCRL** [2971.2, 3016.5] (probe 0193). Each flag has its
+own `*_OFF` ablation knob, and all six together restore the 0.8.0 search
+tree bit-for-bit.
 
 ### One difference between this snapshot and production
 
@@ -162,10 +173,11 @@ production, guard on     61578    320482   10633799
 ```
 
 Note the shape of it: the guard costs 44 nodes at `bench 8` and 1.4M at
-`bench 13`. That gap is the same phenomenon described above — whether the
-table fills up — and it is why the feature looked worthless on a fast
-control. The five features that are present here account for the rest of
-the package.
+`bench 13`, i.e. it does a great deal of work once the table is under
+pressure. That it nonetheless measured −2 Elo alone at the production
+control (probe 0180) is exactly why node counts are not a strength metric
+in this repository, in either direction. The five features present here
+account for the rest of the package, in proportions nobody has measured.
 
 ## License
 

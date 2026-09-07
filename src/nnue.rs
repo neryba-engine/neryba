@@ -333,6 +333,25 @@ pub fn sub_piece(acc: &mut Acc, pcol: u8, pt0: u8, sq: u8, kings: [u8; 2]) {
     }
 }
 
+/// probe 0207: fused pass "child slot = parent - row" (copy + first delta in a
+/// single memory pass). The remaining deltas are applied in-place on dst. Wrapping
+/// i16 arithmetic is commutative, so delta order does not change the bytes
+/// (bit-identical bench gate).
+#[inline]
+pub fn sub_piece_into(src: &Acc, dst: &mut Acc, pcol: u8, pt0: u8, sq: u8, kings: [u8; 2]) {
+    let n = net();
+    for persp in 0..2u8 {
+        let row = &n.fw[kb_index(feat(persp, pcol, pt0, sq), ksq_or(persp, kings))];
+        let s = &src[persp as usize];
+        let d = &mut dst[persp as usize];
+        for h in 0..HIDDEN {
+            d[h] = s[h].wrapping_sub(row[h] as i16);
+        }
+        #[cfg(debug_assertions)]
+        assert_headroom(d);
+    }
+}
+
 /// probe 0063: phase bucket by piece count (MaterialCount<NUM_BUCKETS>).
 /// divisor = ceil(32/N) — exact bullet `game/outputs.rs` formula. NUM_BUCKETS=1
 /// -> always 0 (single-bucket arms h512/h1024/aug0041 — byte-identical to the old path).
