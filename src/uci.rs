@@ -43,6 +43,9 @@ impl State {
                 if let Some(m) = Move::from_uci(u) {
                     if self.board.gen_legal().contains(&m) {
                         self.board.make(m);
+                        // incident 0.9.1: the history is linear, there will be no unmake — the
+                        // accumulator stack (0207) overflowed around ply 127
+                        self.board.rebase_acc();
                         self.keys.push(self.board.key);
                     }
                 }

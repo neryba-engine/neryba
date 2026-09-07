@@ -36,7 +36,7 @@ struct FlatSlot {
     depth: i8,
     flag: u8,
     mv: [u8; 3],
-    _pad: u8,
+    age: u8, // probe 0108: search generation of the entry (used by the 0111 age guard)
 }
 const FLAT_EMPTY: u8 = 3;
 const FLAT_BITS: usize = 23;
@@ -138,6 +138,16 @@ pub struct Searcher {
     /// of the 0191 package. A losing capture goes to the very end of the list
     /// (the textbook scheme) instead of sitting between killers and quiets.
     badcap_last: bool,
+    /// probe 0108: search generation, +1 on every `go` (wrapping u8 — entries older
+    /// than 255 moves are dead anyway).
+    tt_age: u8,
+    /// probe 0111 (env NERYBA_TT_AGE_GUARD_OFF) — default-on since 0.9.0 as part of
+    /// the 0191 package. With ONE slot, aging can only be a REFUSAL to write: keep a
+    /// deeper entry of the same generation at the price of not caching the new
+    /// position. The flag DISABLES it. Missing from the public snapshot until
+    /// 0.9.2 — the reason public and prod diverged on `bench 8/13` (not on `bench 5`,
+    /// where the table never fills up).
+    tt_age_guard: bool,
     /// probe 0046 (env NERYBA_IIR_OFF) — default-on since 0.9.0 as part of the
     /// 0191 package. Internal iterative reductions: depth−1 at nodes without a
     /// TT move. The flag DISABLES it.
@@ -245,6 +255,8 @@ impl Searcher {
             hp_depth: std::env::var("NERYBA_HP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
             hp_count: std::env::var("NERYBA_HP_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
             badcap_last: std::env::var("NERYBA_BADCAP_LAST_OFF").is_err(),
+            tt_age: 0,
+            tt_age_guard: std::env::var("NERYBA_TT_AGE_GUARD_OFF").is_err(),
             iir_enabled: std::env::var("NERYBA_IIR_OFF").is_err(),
             iir_min: std::env::var("NERYBA_IIR_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
             // probe 0055 GREEN (+27.6 Elo SPRT accept @1844 — research/0055-
@@ -270,7 +282,7 @@ impl Searcher {
             // research/0068-flat-tt/VERDICT.md): flat-TT default-on
             flat_on: std::env::var("NERYBA_FLAT_TT_OFF").is_err(),
             flat_tt: if std::env::var("NERYBA_FLAT_TT_OFF").is_err() {
-                vec![FlatSlot { key: 0, score: 0, depth: 0, flag: FLAT_EMPTY, mv: [0; 3], _pad: 0 }; 1 << FLAT_BITS]
+                vec![FlatSlot { key: 0, score: 0, depth: 0, flag: FLAT_EMPTY, mv: [0; 3], age: 0 }; 1 << FLAT_BITS]
             } else {
                 Vec::new()
             },
@@ -314,8 +326,19 @@ impl Searcher {
         if self.flat_on {
             let idx = (key as usize) & ((1 << FLAT_BITS) - 1);
             let mv = best.map(|m| [m.from, m.to, m.promo]).unwrap_or([0; 3]);
+            let old = &self.flat_tt[idx];
+            // probe 0111: the only possible aging action with one slot — refuse to
+            // evict a deeper entry of the SAME generation for a different position.
+            if self.tt_age_guard
+                && old.flag != FLAT_EMPTY
+                && old.key != key
+                && (old.depth as i32) > depth
+                && old.age == self.tt_age
+            {
+                return;
+            }
             self.flat_tt[idx] = FlatSlot {
-                key, score: pack_score(score), depth: depth as i8, flag, mv, _pad: 0,
+                key, score: pack_score(score), depth: depth as i8, flag, mv, age: self.tt_age,
             };
         } else {
             self.tt.insert(key, TtEntry { depth, flag, score, best });
@@ -976,6 +999,11 @@ impl Searcher {
         soft: Option<f64>,
         hard: Option<f64>,
     ) -> (Option<Move>, i32, i32) {
+        // incident 0.9.1: search root = root of the accumulator stack (0207); no unmake
+        // below the root, so resetting the index is safe and bit-identical.
+        b.rebase_acc();
+        // probe 0108: new search generation (every go).
+        self.tt_age = self.tt_age.wrapping_add(1);
         // probe 0055 (env NERYBA_PERSIST): state lives across game moves;
         // cap-clear — backstop against TT bloat (PREREG 0055)
         if !self.persist_enabled || self.tt_over_cap() {

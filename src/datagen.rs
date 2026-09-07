@@ -185,6 +185,7 @@ fn play_game(
         }
 
         b.make(mv);
+        b.rebase_acc(); // incident 0.9.1: a played move = new root of the accumulator stack (0207)
         keys.push(b.key);
         plies += 1;
     };

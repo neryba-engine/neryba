@@ -197,7 +197,12 @@ const _: () = assert!(std::mem::size_of::<Undo>() <= 32);
 
 /// probe 0207: accumulator stack depth (margin over killers[64] and any search ply).
 /// Overflow panics on indexing: better to crash than to silently corrupt the eval.
-pub const ACC_STACK: usize = 128;
+/// INCIDENT 0.9.1 (2026-09-07): the stack grows on EVERY make without unmake — the UCI
+/// `position ... moves` history and datagen replay a game linearly, so the engine
+/// panicked around ply 127 (time losses). Fix — `rebase_acc()` wherever the history is
+/// linear (uci after every history move, datagen after a played move, search entry);
+/// 256 instead of 128 is margin for search depth, not for history.
+pub const ACC_STACK: usize = 256;
 
 #[derive(Clone)]
 pub struct Board {
@@ -235,6 +240,20 @@ impl Board {
     #[inline]
     pub fn acc(&self) -> &crate::nnue::Acc {
         &self.acc_stack[self.acc_ply]
+    }
+
+    /// Incident 0.9.1: make the current position the root of the accumulator stack
+    /// (slot 0 = current, `acc_ply` = 0). Call where the history is linear and no
+    /// unmake below this point is possible: after every history move in UCI
+    /// `position`, after a played move in datagen, at search entry. The accumulator
+    /// value does not change -> tree and eval stay bit-identical.
+    #[inline]
+    pub fn rebase_acc(&mut self) {
+        if self.acc_ply != 0 {
+            let cur = self.acc_stack[self.acc_ply];
+            self.acc_stack[0] = cur;
+            self.acc_ply = 0;
+        }
     }
 
     pub fn from_fen(fen: &str) -> Result<Board, String> {
@@ -1521,6 +1540,31 @@ mod tests {
         }
         eprintln!("0212 oracle: {n} positions OK");
         assert!(n >= 300, "too few positions for the oracle: {n}");
+    }
+
+    /// Incident 0.9.1 (regression): a long game through the UCI `position ... moves` path
+    /// (make + rebase per history move) does NOT overflow the accumulator stack, and the
+    /// accumulator after rebase equals a full recompute. 400 plies > ACC_STACK.
+    #[test]
+    fn long_game_history_does_not_overflow_acc_stack_0901() {
+        let mut b = Board::startpos();
+        let mut rng: u64 = 0x0901_2026;
+        let mut plies = 0;
+        while plies < 400 {
+            let ms = b.gen_legal();
+            if ms.is_empty() || b.halfmove >= 100 {
+                b = Board::startpos();
+                continue;
+            }
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let m = ms[(rng % ms.len() as u64) as usize];
+            b.make(m);
+            b.rebase_acc();
+            assert_eq!(b.acc_ply, 0);
+            assert_eq!(*b.acc(), crate::nnue::refresh(&b.sq, b.occ[0] | b.occ[1], b.king));
+            plies += 1;
+        }
+        assert!(!b.gen_legal().is_empty());
     }
 
     /// probe 0207, control 2: the accumulator stack equals a full recompute after every
