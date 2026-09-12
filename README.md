@@ -53,7 +53,8 @@ sums of individual verdicts are never quoted as strength claims.
 
 ## Facts
 
-- Language: Rust, single thread (for now), zero external crates
+- Language: Rust, zero external crates; Lazy SMP via the `Threads` UCI
+  option (default 1; production runs 4 since 0.10.0, see below)
 - Evaluation: own NNUE `(768→128)x2→1` with 8 phase-conditioned output
   buckets (probe 0063) and an i16 SIMD-dense layout (probe 0093,
   +12% NPS bit-exact), trained from scratch on self-play data with
@@ -152,32 +153,55 @@ engine at **≈2993 CCRL** [2971.2, 3016.5] (probe 0193). Each flag has its
 own `*_OFF` ablation knob, and all six together restore the 0.8.0 search
 tree bit-for-bit.
 
-### One difference between this snapshot and production
+Versions 0.9.1 and 0.9.2 change no search decision at all. Three
+node-invariant levers from a profile of the hot path (probe 0205) —
+quiescence entered before the move list is generated (0206), an
+accumulator stack instead of a per-ply copy (0207), and a capture-only
+generator for quiescence nodes (0212) — add up to **+54% nodes per second**
+with the tree bit-for-bit unchanged (`bench 5` = 61578, `bench 13` =
+10633799 before and after). 0.9.1 shipped with a bug: the accumulator stack
+overflowed on game histories longer than 127 plies, so the engine crashed
+mid-game and lost on time; 0.9.2 rebases the stack on every root and carries
+a regression test for it. Re-run on the same four anchors and the same
+protocol (probe 0215), 0.9.2 measures **≈3086 CCRL** [3061.9, 3113.6] —
++93 over 0.9.0, i.e. the speed transfers to the clock almost entirely.
 
-**`NERYBA_TT_AGE_GUARD` is not part of this snapshot.** The guard refuses
-a transposition-table write when the slot already holds a deeper, equally
-recent entry for a different position — and that requires an age field in
-the slot. Production uses an atomic, aged flat table; the table published
-here is the simpler `FlatSlot { key, score, depth, flag, mv }` with no age
-at all, so the feature has nothing to key off. Porting it means porting a
-different table, which is a separate piece of work rather than a flag.
+Version 0.10.0 changes no engine code either; it is the same binary played
+with `Threads: 4`. The Lazy SMP code (probes 0156–0159, August 2026) is
+published here for the first time — helper threads search the same root over
+a shared, atomically packed transposition table, the main thread's result is
+used — but three early
+strength tests killed it, and only a later diagnostic run (probe 0202)
+showed why: at equal depth the multi-threaded search was never worse than
+single-threaded (2.0% of positions vs a 1.5% control), time-to-depth scaled
+1.76x on 4 threads, and the losses had come from over-subscribed cloud pods,
+not from the search. Measured properly (probe 0214, 20+0.2, one game at a
+time), 4 threads are worth **+84 Elo** [+26, +148] over 1 thread in
+self-play; against the external anchors at 10+0.1 (probe 0215) the same
+setting measures **≈3101** [3075.7, 3127.5], only +14.8 [−22, +51] over the
+single-threaded number at that fast control. The two rows are kept apart —
+1-CPU and 4-CPU are different lists — and the 4-CPU number is a production
+setting, not a claim about the engine's core.
 
-The difference is measured, not estimated. This snapshot reproduces
-production bit-for-bit on every bench once the guard is disabled there:
+### This snapshot and production
+
+Since 0.9.2 the snapshot carries the same aged, atomically packed flat
+transposition table as production, so the age guard (`NERYBA_TT_AGE_GUARD_OFF`
+is its ablation knob) and Lazy SMP are both here, and every bench matches
+production bit-for-bit:
 
 ```
                         bench 5   bench 8   bench 13
-this snapshot            61578    320526    9234230
-production, guard off    61578    320526    9234230
-production, guard on     61578    320482   10633799
+this snapshot            61578    320482   10633799
+production 0.10.0        61578    320482   10633799
 ```
 
-Note the shape of it: the guard costs 44 nodes at `bench 8` and 1.4M at
-`bench 13`, i.e. it does a great deal of work once the table is under
-pressure. That it nonetheless measured −2 Elo alone at the production
-control (probe 0180) is exactly why node counts are not a strength metric
-in this repository, in either direction. The five features present here
-account for the rest of the package, in proportions nobody has measured.
+What is not here: the UCI `Hash` option (probe 0107) and the internal
+statistics counters of the research build — this snapshot uses the fixed
+128 MiB table, which is also what production plays with. A note on the guard
+itself: it costs 44 nodes at `bench 8` and 1.4M at `bench 13`, yet measured
+−2 Elo alone at the production control (probe 0180) — node counts are not a
+strength metric in this repository, in either direction.
 
 ## License
 

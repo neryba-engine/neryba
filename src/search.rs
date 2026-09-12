@@ -10,6 +10,8 @@
 use crate::board::*;
 use crate::eval::{evaluate, MATE, MATE_THRESHOLD, PIECE_VALUES};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const INF: i32 = 1_000_000_000;
@@ -27,16 +29,45 @@ struct TtEntry {
 }
 
 /// probe 0068 (env NERYBA_FLAT_TT): packed 16B slot.
-/// score: the mate range is encoded via ∓70_000 (PREREG addendum); flag=3 = empty.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct FlatSlot {
-    key: u64,
-    score: i16,
-    depth: i8,
-    flag: u8,
-    mv: [u8; 3],
-    age: u8, // probe 0108: search generation of the entry (used by the 0111 age guard)
+/// score: the mate range is encoded via ∓70_000 (PREREG addendum); flag=3 = empty;
+/// age = search generation of the entry (probe 0108, used by the 0111 age guard).
+/// probe 0157: the same 16-byte slot held in two atomics so the table can be
+/// shared between threads (stage B-1 of Lazy SMP). The payload is packed into
+/// one u64 and the key is stored as `key ^ data` (the Stockfish pattern): if two
+/// threads tear the pair, the check fails and the entry reads as a miss instead
+/// of returning spliced data. With one thread nothing ever tears — the tree is
+/// bit-for-bit the same as with the plain struct.
+pub struct AtomicSlot {
+    key: AtomicU64,
+    data: AtomicU64,
+}
+
+#[inline]
+fn pack_slot(score: i16, depth: i8, flag: u8, mv: [u8; 3], age: u8) -> u64 {
+    (score as u16 as u64)
+        | ((depth as u8 as u64) << 16)
+        | ((flag as u64) << 24)
+        | ((mv[0] as u64) << 32)
+        | ((mv[1] as u64) << 40)
+        | ((mv[2] as u64) << 48)
+        | ((age as u64) << 56)
+}
+
+#[inline]
+fn unpack_slot(d: u64) -> (i16, i8, u8, [u8; 3], u8) {
+    (
+        (d & 0xFFFF) as u16 as i16,
+        ((d >> 16) & 0xFF) as u8 as i8,
+        ((d >> 24) & 0xFF) as u8,
+        [((d >> 32) & 0xFF) as u8, ((d >> 40) & 0xFF) as u8, ((d >> 48) & 0xFF) as u8],
+        ((d >> 56) & 0xFF) as u8,
+    )
+}
+
+#[inline]
+fn empty_slot() -> AtomicSlot {
+    let d = pack_slot(0, 0, FLAT_EMPTY, [0; 3], 0);
+    AtomicSlot { key: AtomicU64::new(0 ^ d), data: AtomicU64::new(d) }
 }
 const FLAT_EMPTY: u8 = 3;
 const FLAT_BITS: usize = 23;
@@ -62,8 +93,23 @@ pub struct Searcher {
     /// extended along the search path — repetition detection sees real history
     pub rep_keys: Vec<u64>,
     deadline: Option<Instant>,
-    stop: bool,
+    /// probe 0156: an atomic rather than a bool so the search can be stopped from
+    /// another thread (`stop_handle`). Relaxed is enough: a one-way false→true
+    /// flag, no other data is published through it.
+    stop: Arc<AtomicBool>,
     tick: u32,
+    /// probe 0158, gate 1.5: total nodes searched by the helper threads
+    pub helper_nodes: u64,
+    /// probe 0158 addendum B: starting depth of iterative deepening. Lazy SMP
+    /// helpers start at different depths (1 + i%3) — without that spread every
+    /// thread does IDENTICAL work and merely fights over the TT (measured: time-
+    /// to-depth gained +1 ply instead of the expected +2..3). The main thread is
+    /// always 1, so the Threads=1 bench stays bit-for-bit.
+    start_depth: i32,
+    /// probe 0158 addendum D: a helper must NOT reset the shared `stop`. Without
+    /// this a starting helper cleared the flag the main thread had just raised on
+    /// its deadline, and the main thread searched past the move budget.
+    is_helper: bool,
     /// TM3 (probe 0025): whether the instability-based extension fired
     pub tm3_extended: bool,
     /// probe 0026 (datagen): deterministic node-count stop; UCI/matches
@@ -187,7 +233,8 @@ pub struct Searcher {
     /// probe 0068 (env NERYBA_FLAT_TT): flat array instead of the HashMap.
     /// off = HashMap path bit-for-bit.
     flat_on: bool,
-    flat_tt: Vec<FlatSlot>,
+    /// probe 0157: Arc so Lazy SMP (0158) can hand the same table to helper threads
+    flat_tt: Arc<Vec<AtomicSlot>>,
     /// 0068 frame-F1: counter of cap-clear firings (bundle/structure attribution)
     pub cap_clears: u64,
 }
@@ -216,7 +263,10 @@ impl Searcher {
             deadline: None,
             tm3_extended: false,
             node_limit: None,
-            stop: false,
+            stop: Arc::new(AtomicBool::new(false)),
+            helper_nodes: 0,
+            start_depth: 1,
+            is_helper: false,
             tick: 0,
             nodes: 0,
             bufs: Vec::new(),
@@ -281,11 +331,11 @@ impl Searcher {
             // probe 0068 GREEN (+17.4 STC ACCEPT + LTC sign +27.9 —
             // research/0068-flat-tt/VERDICT.md): flat-TT default-on
             flat_on: std::env::var("NERYBA_FLAT_TT_OFF").is_err(),
-            flat_tt: if std::env::var("NERYBA_FLAT_TT_OFF").is_err() {
-                vec![FlatSlot { key: 0, score: 0, depth: 0, flag: FLAT_EMPTY, mv: [0; 3], age: 0 }; 1 << FLAT_BITS]
+            flat_tt: Arc::new(if std::env::var("NERYBA_FLAT_TT_OFF").is_err() {
+                (0..1usize << FLAT_BITS).map(|_| empty_slot()).collect::<Vec<_>>()
             } else {
                 Vec::new()
-            },
+            }),
             cap_clears: 0,
         }
     }
@@ -307,12 +357,16 @@ impl Searcher {
     #[inline]
     fn tt_probe(&self, key: u64) -> Option<(i32, u8, i32, Option<Move>)> {
         if self.flat_on {
-            let s = &self.flat_tt[(key as usize) & ((1 << FLAT_BITS) - 1)];
-            if s.flag != FLAT_EMPTY && s.key == key {
-                let best = if s.mv == [0; 3] { None } else {
-                    Some(Move { from: s.mv[0], to: s.mv[1], promo: s.mv[2] })
+            let slot = &self.flat_tt[(key as usize) & ((1 << FLAT_BITS) - 1)];
+            // probe 0157: data first, then key — the XOR verifies the pair is intact
+            let d = slot.data.load(Ordering::Relaxed);
+            let k = slot.key.load(Ordering::Relaxed);
+            let (score, depth, flag, mv, _age) = unpack_slot(d);
+            if flag != FLAT_EMPTY && (k ^ d) == key {
+                let best = if mv == [0; 3] { None } else {
+                    Some(Move { from: mv[0], to: mv[1], promo: mv[2] })
                 };
-                return Some((s.depth as i32, s.flag, unpack_score(s.score), best));
+                return Some((depth as i32, flag, unpack_score(score), best));
             }
             None
         } else {
@@ -326,20 +380,25 @@ impl Searcher {
         if self.flat_on {
             let idx = (key as usize) & ((1 << FLAT_BITS) - 1);
             let mv = best.map(|m| [m.from, m.to, m.promo]).unwrap_or([0; 3]);
-            let old = &self.flat_tt[idx];
+            let slot = &self.flat_tt[idx];
+            let od = slot.data.load(Ordering::Relaxed);
+            let ok = slot.key.load(Ordering::Relaxed);
+            let (_os, odepth, oflag, _omv, oage) = unpack_slot(od);
             // probe 0111: the only possible aging action with one slot — refuse to
             // evict a deeper entry of the SAME generation for a different position.
             if self.tt_age_guard
-                && old.flag != FLAT_EMPTY
-                && old.key != key
-                && (old.depth as i32) > depth
-                && old.age == self.tt_age
+                && oflag != FLAT_EMPTY
+                && (ok ^ od) != key
+                && (odepth as i32) > depth
+                && oage == self.tt_age
             {
                 return;
             }
-            self.flat_tt[idx] = FlatSlot {
-                key, score: pack_score(score), depth: depth as i8, flag, mv, age: self.tt_age,
-            };
+            // probe 0157: data FIRST, key (XORed) second — a reader that sees the
+            // new key also sees the new data
+            let nd = pack_slot(pack_score(score), depth as i8, flag, mv, self.tt_age);
+            slot.data.store(nd, Ordering::Relaxed);
+            slot.key.store(key ^ nd, Ordering::Relaxed);
         } else {
             self.tt.insert(key, TtEntry { depth, flag, score, best });
         }
@@ -348,7 +407,11 @@ impl Searcher {
     #[inline]
     fn tt_clear_all(&mut self) {
         if self.flat_on {
-            self.flat_tt.iter_mut().for_each(|s| s.flag = FLAT_EMPTY);
+            let d = pack_slot(0, 0, FLAT_EMPTY, [0; 3], 0);
+            for s in self.flat_tt.iter() {
+                s.data.store(d, Ordering::Relaxed);
+                s.key.store(0 ^ d, Ordering::Relaxed);
+            }
         } else {
             self.tt.clear();
         }
@@ -374,12 +437,12 @@ impl Searcher {
             self.tick = 0;
             if let Some(d) = self.deadline {
                 if Instant::now() >= d {
-                    self.stop = true;
+                    self.stop.store(true, Ordering::Relaxed);
                 }
             }
             if let Some(nl) = self.node_limit {
                 if self.nodes >= nl {
-                    self.stop = true;
+                    self.stop.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -480,7 +543,7 @@ impl Searcher {
 
     fn quiescence(&mut self, b: &mut Board, mut alpha: i32, beta: i32, ply: i32, qply: i32) -> i32 {
         self.check_time();
-        if self.stop {
+        if self.stop.load(Ordering::Relaxed) {
             return alpha;
         }
         self.nodes += 1;
@@ -604,7 +667,7 @@ impl Searcher {
     /// probe 0013: depth-0 store that never clobbers a real alpha_beta entry.
     #[inline]
     fn qtt_store(&mut self, key: u64, score: i32, flag: u8, ply: i32) {
-        if !self.qtt_enabled || self.stop {
+        if !self.qtt_enabled || self.stop.load(Ordering::Relaxed) {
             return;
         }
         if let Some((e_depth, _f, _s, _b)) = self.tt_probe(key) {
@@ -623,7 +686,7 @@ impl Searcher {
 
     fn alpha_beta(&mut self, b: &mut Board, mut depth: i32, mut alpha: i32, mut beta: i32, ply: i32, prev: Option<usize>, excluded: Option<Move>) -> i32 {
         self.check_time();
-        if self.stop {
+        if self.stop.load(Ordering::Relaxed) {
             return alpha;
         }
         self.nodes += 1;
@@ -776,7 +839,7 @@ impl Searcher {
             if ts.abs() < MATE_THRESHOLD {
                 let s_beta = ts - self.sing_margin * depth;
                 let v = self.alpha_beta(b, (depth - 1) / 2, s_beta - 1, s_beta, ply, prev, tt_move);
-                if !self.stop && v < s_beta {
+                if !self.stop.load(Ordering::Relaxed) && v < s_beta {
                     sing_ext = 1;
                     self.sing_count += 1;
                 }
@@ -913,7 +976,7 @@ impl Searcher {
         }
         self.put_buf(ply as usize, moves);
 
-        if !self.stop && excluded.is_none() {
+        if !self.stop.load(Ordering::Relaxed) && excluded.is_none() {
             let flag = if best <= alpha_orig {
                 UPPER
             } else if best >= beta {
@@ -964,7 +1027,7 @@ impl Searcher {
             let score = -self.alpha_beta(b, depth - 1, -beta, -alpha, 1, child_prev, None);
             self.rep_keys.pop();
             b.unmake(m, undo);
-            if self.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 break;
             }
             if score > best {
@@ -992,6 +1055,80 @@ impl Searcher {
     /// TM3 (probe 0025): `soft` — base budget; `hard` — ceiling for a single
     /// extension when at the soft limit the best move is unstable between
     /// the last completed iterations (easy/hard move).
+    /// probe 0158 (Lazy SMP): a helper that SHARES the TT and `stop` with the main
+    /// thread but owns its killers/history/conthist/buffers. Only the table is
+    /// meant to be shared — the local heuristics are local for a reason.
+    fn helper_from(&self) -> Searcher {
+        let mut h = Searcher::new();
+        h.flat_tt = Arc::clone(&self.flat_tt); // shared memory — the point of Lazy SMP
+        h.flat_on = self.flat_on;
+        h.stop = Arc::clone(&self.stop); // the main thread stops everyone
+        h.rep_keys = self.rep_keys.clone();
+        h.tt_age = self.tt_age;
+        h.persist_enabled = self.persist_enabled;
+        h.is_helper = true; // addendum D: never clear the shared stop
+        h
+    }
+
+    /// probe 0158: Lazy SMP. `threads` threads search THE SAME root over a shared
+    /// TT and diverge naturally through races for entries — there is no
+    /// synchronisation, hence the name. The main thread's result is used; the
+    /// helpers only warm the table. `threads <= 1` is exactly the old path
+    /// (gate 1.1: bench bit-for-bit).
+    pub fn find_best_move_smp(
+        &mut self,
+        b: &mut Board,
+        max_depth: i32,
+        soft: Option<f64>,
+        hard: Option<f64>,
+        threads: usize,
+    ) -> (Option<Move>, i32, i32) {
+        if threads <= 1 {
+            return self.find_best_move_tm(b, max_depth, soft, hard);
+        }
+        b.rebase_acc(); // incident 0.9.1: helpers clone the board with the stack root at 0
+        self.stop.store(false, Ordering::Relaxed);
+        let mut handles = Vec::new();
+        // probe 0159: helpers get their OWN deadline — 0.9 of the main thread's.
+        // In 0158 they ran without a limit and relied on `stop` alone, so the
+        // `join` held the move and the engine lost on time (0-0-500). The factor
+        // guarantees the order: a helper hits its deadline BEFORE the main thread.
+        let h_soft = soft.map(|t| t * 0.9);
+        let h_hard = hard.map(|t| t * 0.9);
+        for i in 1..threads {
+            let mut h = self.helper_from();
+            // 0158 addendum B: different starting depths — otherwise the threads duplicate work
+            h.start_depth = 1 + (i as i32 % 3);
+            let mut hb = b.clone();
+            handles.push(std::thread::spawn(move || {
+                h.find_best_move_tm(&mut hb, max_depth, h_soft, h_hard);
+                h.nodes
+            }));
+        }
+        let out = self.find_best_move_tm(b, max_depth, soft, hard);
+        self.stop.store(true, Ordering::Relaxed);
+        // probe 0159: in a GAME (there is a clock) a live thread must not delay the
+        // move — only finished helpers are collected. In ANALYSIS (`go depth`, no
+        // clock) there is no hurry and the full join is needed so that
+        // `helper_nodes` is reliable (gate 1.5). The presence of a deadline decides.
+        let timed = soft.is_some() || hard.is_some();
+        for hd in handles {
+            if !timed || hd.is_finished() {
+                self.helper_nodes += hd.join().unwrap_or(0);
+            }
+        }
+        out
+    }
+
+    /// probe 0156 (stage A of parallel search): a stop handle for another thread.
+    /// The search can run in `thread::spawn` while the UCI loop keeps reading stdin
+    /// and does `store(true)` on `stop`/`quit`. The tree itself is unchanged — with
+    /// a single-threaded call the flag behaves exactly like the old `bool` (gate:
+    /// bench bit-for-bit).
+    pub fn stop_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
     pub fn find_best_move_tm(
         &mut self,
         b: &mut Board,
@@ -1018,7 +1155,9 @@ impl Searcher {
             self.killers = [[None; 2]; 64];
         }
         self.nodes = 0;
-        self.stop = false;
+        if !self.is_helper {
+            self.stop.store(false, Ordering::Relaxed);
+        }
         self.tick = 0;
         self.tm3_extended = false;
         let t0 = Instant::now();
@@ -1052,20 +1191,20 @@ impl Searcher {
         // probe 0087 (PREREG addendum B): per-iteration info for the label generator.
         // Output-only, default OFF — tree/nodes untouched (bit-exact bench gate).
         let iter_info = std::env::var("NERYBA_ITER_INFO").is_ok();
-        for d in 1..=max_depth {
+        for d in self.start_depth.max(1)..=max_depth {
             let window = if aspiration && d >= 4 && best.0.is_some() {
                 (best.1 - ASP, best.1 + ASP)
             } else {
                 (-INF, INF)
             };
             let (mut mv, mut score) = self.root(b, d, best.0, window);
-            if !self.stop && window.0 > -INF && (score <= window.0 || score >= window.1) {
+            if !self.stop.load(Ordering::Relaxed) && window.0 > -INF && (score <= window.0 || score >= window.1) {
                 // fail-low/high: the truth is outside the guess — full re-search
                 let r = self.root(b, d, best.0, (-INF, INF));
                 mv = r.0;
                 score = r.1;
             }
-            if self.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 // TM3: soft limit exhausted mid-iteration; if the best move
                 // is unstable between the two last completed iterations —
                 // ONE extension up to hard and a retry of this depth (warm TT)
@@ -1076,10 +1215,10 @@ impl Searcher {
                     };
                     if !self.tm3_extended && unstable && Instant::now() < hd {
                         self.tm3_extended = true;
-                        self.stop = false;
+                        self.stop.store(false, Ordering::Relaxed);
                         self.deadline = Some(hd);
                         let r = self.root(b, d, best.0, (-INF, INF));
-                        if !self.stop && r.0.is_some() {
+                        if !self.stop.load(Ordering::Relaxed) && r.0.is_some() {
                             prev_best = best.0;
                             best = (r.0, r.1, d);
                         }
@@ -1170,5 +1309,86 @@ impl Searcher {
             mv = self.tt_probe(work.key).and_then(|(_d, _f, _s, b)| b);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod thread_smoke {
+    //! probe 0156: the search runs in a separate thread and `stop_handle` interrupts
+    //! it; probe 0158/0159: Lazy SMP runs, helpers really search, deadlines hold.
+    //! Infrastructure proofs — strength is measured elsewhere (SPRT, gauntlets).
+    use super::*;
+    use crate::board::Board;
+
+    #[test]
+    fn search_runs_in_thread_and_external_stop_works() {
+        let mut s = Searcher::new();
+        let stop = s.stop_handle();
+        let mut b = Board::startpos();
+        // a depth far beyond what fits before the external stop
+        let h = std::thread::spawn(move || s.find_best_move(&mut b, 30, None));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        stop.store(true, Ordering::Relaxed);
+        let (mv, _score, depth) = h.join().expect("the search thread must not panic");
+        assert!(mv.is_some(), "an interrupted search must still return a move");
+        assert!(depth >= 1, "at least one iteration must complete, got {depth}");
+    }
+
+    /// probe 0158, gates 1.4 and 1.5: SMP does not crash and the helpers REALLY
+    /// search. Without 1.5 a "parallel search" could silently spin empty threads.
+    #[test]
+    fn smp_runs_and_helpers_actually_search() {
+        let mut solo = Searcher::new();
+        let mut b1 = Board::startpos();
+        let (mv1, _s1, _d1) = solo.find_best_move_smp(&mut b1, 9, None, None, 1);
+        assert!(mv1.is_some());
+        assert_eq!(solo.helper_nodes, 0, "Threads=1 must spawn no helpers");
+
+        let mut smp = Searcher::new();
+        let mut b2 = Board::startpos();
+        let (mv2, _s2, _d2) = smp.find_best_move_smp(&mut b2, 9, None, None, 8);
+        assert!(mv2.is_some(), "SMP must return a move");
+        // gate 1.5: helper nodes > 0.5x the main thread (threads are not idle).
+        // No exact number is possible here — races by construction.
+        assert!(
+            smp.helper_nodes > smp.nodes / 2,
+            "helpers barely searched: helper={} main={}",
+            smp.helper_nodes, smp.nodes
+        );
+    }
+
+    /// probe 0158 addendum D / 0159 gate 4: under SMP the main thread must RESPECT
+    /// its soft deadline (0.1 s is the order at which 0158 lost on time).
+    #[test]
+    fn smp_respects_soft_deadline() {
+        let mut s = Searcher::new();
+        let mut b = Board::startpos();
+        let t0 = std::time::Instant::now();
+        let (mv, _sc, _d) = s.find_best_move_smp(&mut b, 30, Some(0.1), None, 8);
+        let el = t0.elapsed().as_secs_f64();
+        assert!(mv.is_some());
+        // release is the real gate (matches only run on it); debug nodes are ~20x
+        // slower and `stop` is polled every N nodes, so the bound is looser there.
+        let limit = if cfg!(debug_assertions) { 6.0 } else { 0.5 };
+        assert!(el < limit, "SMP ignores the 0.1 s budget: {el:.2}s elapsed (limit {limit})");
+    }
+
+    /// probe 0158, gate 1.4: a batch of positions under 8 threads — no panic, no
+    /// deadlock, every one returns a legal move.
+    #[test]
+    fn smp_batch_returns_legal_moves() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1",
+            "8/8/8/4k3/8/4K3/4P3/8 w - - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ];
+        for f in fens {
+            let mut s = Searcher::new();
+            let mut b = Board::from_fen(f).expect("fen");
+            let (mv, _sc, _d) = s.find_best_move_smp(&mut b, 7, None, None, 8);
+            let m = mv.expect("SMP must return a move");
+            assert!(b.gen_legal().contains(&m), "illegal move in {f}");
+        }
     }
 }

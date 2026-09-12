@@ -16,13 +16,24 @@ struct State {
     /// TT/killers/history across moves; without the flag find_best_move_tm
     /// clears them on entry — bit-for-bit the same as a per-go Searcher::new()
     searcher: Searcher,
+    /// probe 0158: number of Lazy SMP threads. Default 1 — the engine does not
+    /// change unless a tester or the bot config sets it explicitly. Lives in State
+    /// because `ucinewgame` recreates the Searcher.
+    threads: usize,
 }
 
 impl State {
     fn new() -> State {
         let board = Board::startpos();
         let keys = vec![board.key];
-        State { board, keys, searcher: Searcher::new() }
+        State {
+            board, keys, searcher: Searcher::new(),
+            // probe 0158: env default in the pattern of the other repo flags — the
+            // match harness cannot send setoption, so arms are set via
+            // NERYBA_THREADS. `setoption name Threads` takes precedence.
+            threads: std::env::var("NERYBA_THREADS").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 16),
+        }
     }
 
     fn set_position(&mut self, tokens: &[&str]) {
@@ -94,13 +105,36 @@ pub fn run() {
                 // version comes from Cargo.toml — single source (publication rule 2026-08-04)
                 let _ = writeln!(out, "id name Neryba {}", env!("CARGO_PKG_VERSION"));
                 let _ = writeln!(out, "id author Dmytro Dehtiarov");
+                // probe 0158: default 1 — without an explicit setoption the engine plays single-threaded
+                let _ = writeln!(out, "option name Threads type spin default 1 min 1 max 16");
                 let _ = writeln!(out, "uciok");
             }
             "isready" => {
                 let _ = writeln!(out, "readyok");
             }
+            "setoption" => {
+                // `setoption name Threads value N` (the name is case-insensitive)
+                let mut name = None;
+                let mut val = None;
+                let mut it = tokens[1..].iter();
+                while let Some(t) = it.next() {
+                    match *t {
+                        "name" => name = it.next().map(|v| v.to_ascii_lowercase()),
+                        "value" => val = it.next().and_then(|v| v.parse::<usize>().ok()),
+                        _ => {}
+                    }
+                }
+                if name.as_deref() == Some("threads") {
+                    if let Some(v) = val {
+                        st.threads = v.clamp(1, 16);
+                    }
+                }
+            }
             "ucinewgame" => {
+                // `State::new()` replaces st entirely — take the value BEFORE recreating it
+                let keep_threads = st.threads;
                 st = State::new();
+                st.threads = keep_threads;
             }
             "position" => st.set_position(&tokens[1..]),
             "go" => {
@@ -147,6 +181,8 @@ pub fn run() {
                     (DEFAULT_DEPTH, None, None)
                 };
 
+                // probe 0158: threads is read BEFORE the mutable borrow of st
+                let st_threads = st.threads;
                 let searcher = &mut st.searcher;
                 // probe 0070: `go nodes N` -> node_limit (the core had it from the
                 // datagen path, UCI never wired it). Resetting it every move is
@@ -154,7 +190,8 @@ pub fn run() {
                 searcher.node_limit = args.get("nodes").map(|&n| n as u64);
                 searcher.rep_keys = st.keys.clone();
                 let mut b = st.board.clone();
-                let (mv, score, reached) = searcher.find_best_move_tm(&mut b, depth, movetime, hard);
+                let (mv, score, reached) =
+                    searcher.find_best_move_smp(&mut b, depth, movetime, hard, st_threads);
                 if st.searcher.cap_clears > 0 {
                     let _ = writeln!(out, "info string capclears {}", st.searcher.cap_clears);
                 }
